@@ -8,7 +8,7 @@ from yt_dlp import YoutubeDL
 # ─── CONFIG & CACHING ───────────────────────────────────────────────────────
 TOKEN       = "bot token"
 USE_CACHE   = True
-track_cache = {}  # maps query_or_url -> metadata dict (no requester)
+track_cache = {}
 
 ydl_opts = {
     'format':           'bestaudio/best',
