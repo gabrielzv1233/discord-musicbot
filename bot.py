@@ -4,12 +4,14 @@ import re
 import random
 import asyncio
 from urllib.parse import urlparse, parse_qs
+import aiohttp
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, button, Button
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 TOKEN       = "bot token"
 USE_CACHE   = True
@@ -30,8 +32,7 @@ def load_cache():
                 cache_entries = data
             else:
                 for k,v in data.items():
-                    entry = {"keys":[k], **v}
-                    cache_entries.append(entry)
+                    cache_entries.append({"keys":[k], **v})
             for entry in cache_entries:
                 for k in entry.get("keys", []):
                     key_map[k] = entry
@@ -50,18 +51,19 @@ def save_cache():
 load_cache()
 
 ydl_opts = {
-    'format': 'bestaudio[abr<=64]',
-    'quiet': True,
-    'noplaylist': True,
-    'extract_flat': False,
-    'forcejson': True,
+    'format':             'bestaudio[abr<=64]',
+    'quiet':              True,
+    'noplaylist':         True,
+    'forcejson':          True,
     'nocheckcertificate': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'geo_bypass': True,
+    'default_search':     'auto',
+    'source_address':     '0.0.0.0',
+    'geo_bypass':         True,
     'geo_bypass_country': 'US',
 }
 
+stream_ydl = YoutubeDL(ydl_opts)
+search_ydl = YoutubeDL({**ydl_opts, 'extract_flat': True, 'skip_download': True})
 url_re = re.compile(r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/')
 
 intents = discord.Intents.default()
@@ -92,7 +94,7 @@ async def ensure_voice(inter: discord.Interaction) -> bool:
     if not voice_client or not voice_client.is_connected():
         voice_client = await vc.connect()
     elif voice_client.channel != vc:
-        await inter.followup.send("🚫 You must be in the same VC as me to control me.", ephemeral=True)
+        await inter.followup.send("🚫 You must be in the same VC as me.", ephemeral=True)
         return False
     text_channel = inter.channel
     return True
@@ -104,17 +106,14 @@ def canonical_url(raw_url: str) -> str | None:
         vid = o.path.lstrip('/')
     elif 'youtube.com' in net:
         if o.path == '/watch':
-            q = parse_qs(o.query)
-            vid = q.get('v',[None])[0]
+            vid = parse_qs(o.query).get('v',[None])[0]
         elif o.path.startswith('/shorts/'):
             vid = o.path.split('/')[2]
         else:
             return None
     else:
         return None
-    if not vid:
-        return None
-    return f"https://www.youtube.com/watch?v={vid}"
+    return f"https://www.youtube.com/watch?v={vid}" if vid else None
 
 async def auto_disconnect():
     global voice_client, disconnect_task
@@ -148,8 +147,37 @@ async def _play_next():
         return
 
     item = music_queue.pop(0)
-    if not item.get('url'):
-        return await _play_next()
+    music_history.insert(0, item)
+
+    # check for 403 and refresh cache if needed
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(item['url']) as resp:
+                if resp.status == 403:
+                    raise aiohttp.ClientResponseError(None, None, status=403)
+    except Exception:
+        # refresh this entry: keep only webpage_url as key
+        entry = key_map.get(item['webpage_url'])
+        if entry:
+            entry['keys'] = [item['webpage_url']]
+            # try full info extract
+            try:
+                raw = stream_ydl.extract_info(item['webpage_url'], download=False)
+            except DownloadError:
+                flat = search_ydl.extract_info(f"ytsearch1:{item['title']}", download=False)
+                e = flat['entries'][0]
+                raw = stream_ydl.extract_info(f"https://www.youtube.com/watch?v={e['id']}", download=False)
+            entry.update({
+                'url': raw['url'],
+                'duration': raw['duration'],
+                'title': raw['title'],
+                'uploader': raw.get('uploader','')
+            })
+            save_cache()
+            item['url'] = entry['url']
+            item['duration'] = entry['duration']
+            item['title'] = entry['title']
+            item['uploader'] = entry['uploader']
 
     source = discord.FFmpegPCMAudio(
         item['url'],
@@ -171,25 +199,20 @@ async def _play_next():
     embed.add_field(name="Duration",     value=f"`{format_duration(item['duration'])}`", inline=True)
     embed.add_field(name="Author",       value=f"`{item['uploader']}`", inline=True)
 
-    view = NowPlayingView()
     now_playing_msg = await text_channel.send(
         embed=embed,
-        view=view,
+        view=NowPlayingView(),
         allowed_mentions=discord.AllowedMentions.none()
     )
 
 async def _handle_add(inter: discord.Interaction, query: str, front: bool):
     try:
-        opts = ydl_opts.copy()
-        def extract(q):
-            with YoutubeDL(opts) as y:
-                return y.extract_info(q, False)
         key = query.strip() if url_re.match(query) else query.strip().lower()
         if USE_CACHE and key in key_map:
             entry = key_map[key]
         else:
             search_str = query if url_re.match(query) else f"ytsearch1:{query}"
-            raw = await asyncio.to_thread(extract, search_str)
+            raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(search_str, download=False))
             if 'entries' in raw:
                 raw = raw['entries'][0]
             info = {
@@ -199,13 +222,10 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
                 'duration': raw['duration'],
                 'uploader': raw.get('uploader','')
             }
-            entry = None
-            for e in cache_entries:
-                if e.get('webpage_url') == info['webpage_url']:
-                    e.update(info)
-                    entry = e
-                    break
-            if not entry:
+            entry = next((e for e in cache_entries if e['webpage_url']==info['webpage_url']), None)
+            if entry:
+                entry.update(info)
+            else:
                 entry = {'keys':[], **info}
                 cache_entries.append(entry)
             if key not in entry['keys']:
@@ -224,16 +244,16 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
 
         if front:
             music_queue.insert(0, item)
-            title_text = "Song Added to Queue #1"
+            pos = 1
         else:
             music_queue.append(item)
-            title_text = f"Song Added to Queue #{len(music_queue)}"
+            pos = len(music_queue)
 
-        if len(music_queue) == (1 if not front else 0) and not voice_client.is_playing() and not voice_client.is_paused():
+        if pos == 1 and not voice_client.is_playing() and not voice_client.is_paused():
             await _play_next()
 
         embed = discord.Embed(
-            title=title_text,
+            title=f"Song Added to Queue #{pos}",
             description=f"[{item['title']}]({item['webpage_url']}) [`{format_duration(item['duration'])}`]",
             color=discord.Color.blue()
         )
@@ -243,18 +263,14 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
         await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
 
 class NowPlayingView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
     @button(label="🔀 Shuffle", style=discord.ButtonStyle.primary, custom_id="shuffle")
     async def shuffle(self, inter, btn):
         if music_queue:
             random.shuffle(music_queue)
-            desc = f"@{inter.user.name} shuffled the queue"
+            desc = f"{inter.user.mention} shuffled the queue"
         else:
-            desc = f"@{inter.user.name} tried to shuffle but the queue is empty"
-        embed = discord.Embed(description=desc, color=discord.Color.blue())
-        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            desc = f"{inter.user.mention} tried to shuffle but queue empty"
+        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏪ Back", style=discord.ButtonStyle.primary, custom_id="previous")
     async def previous(self, inter, btn):
@@ -262,51 +278,43 @@ class NowPlayingView(View):
             prev = music_history.pop(0)
             music_queue.insert(0, prev)
             voice_client.stop()
-            desc = f"@{inter.user.name} playing previous track: {prev['title']}"
+            desc = f"{inter.user.mention} playing previous track: {prev['title']}"
         else:
-            desc = f"@{inter.user.name} tried to go back but no previous track"
-        embed = discord.Embed(description=desc, color=discord.Color.blue())
-        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            desc = f"{inter.user.mention} tried to go back but none"
+        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏸ Pause", style=discord.ButtonStyle.primary, custom_id="pauseplay")
     async def pauseplay(self, inter, btn):
         if voice_client.is_playing():
             voice_client.pause()
             btn.label = "▶️ Play"
-            desc = f"@{inter.user.name} paused playback"
+            desc = f"{inter.user.mention} paused playback"
         elif voice_client.is_paused():
             voice_client.resume()
             btn.label = "⏸ Pause"
-            desc = f"@{inter.user.name} resumed playback"
+            desc = f"{inter.user.mention} resumed playback"
         elif music_queue:
             await _play_next()
-            btn.label = "⏸ Pause"
-            desc = f"@{inter.user.name} started playback"
+            desc = f"{inter.user.mention} started playback"
         else:
-            desc = f"@{inter.user.name} tried to play but the queue is empty"
-            embed = discord.Embed(description=desc, color=discord.Color.blue())
-            return await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-
+            return await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} tried to play but queue empty", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
         await inter.response.edit_message(view=self)
-        embed = discord.Embed(description=desc, color=discord.Color.blue())
-        await inter.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏭ Next", style=discord.ButtonStyle.primary, custom_id="skip")
     async def skip(self, inter, btn):
         if voice_client.is_playing():
             voice_client.stop()
-            desc = f"@{inter.user.name} skipped the track"
+            desc = f"{inter.user.mention} skipped the track"
         else:
-            desc = f"@{inter.user.name} tried to skip but nothing is playing"
-        embed = discord.Embed(description=desc, color=discord.Color.blue())
-        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            desc = f"{inter.user.mention} tried to skip but nothing is playing"
+        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏹ Stop", style=discord.ButtonStyle.danger, custom_id="stop")
     async def stop(self, inter, btn):
         clear_all()
-        desc = f"@{inter.user.name} stopped playback and cleared the queue"
-        embed = discord.Embed(description=desc, color=discord.Color.blue())
-        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        desc = f"{inter.user.mention} stopped playback and cleared the queue"
+        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
 
 class QueueView(View):
     def __init__(self, page=0):
@@ -346,11 +354,11 @@ def make_queue_embed(page=0) -> discord.Embed:
         )
     return e
 
-@bot.tree.command(name="join", description="Join your voice channel (or move me there)")
+@bot.tree.command(name="join", description="Join your voice channel")
 async def join(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
     if await ensure_voice(inter):
-        await inter.followup.send("✅ Joined your voice channel.", ephemeral=False)
+        await inter.followup.send("✅ Joined your voice channel.")
 
 @bot.tree.command(name="play", description="Add a song to the queue")
 @app_commands.describe(query="YouTube URL or search terms")
@@ -376,7 +384,7 @@ async def skip(inter: discord.Interaction):
     if not voice_client.is_playing():
         return await inter.followup.send("⏭ Nothing is playing.", ephemeral=True)
     voice_client.stop()
-    await inter.followup.send("⏭ Skipped.", ephemeral=False)
+    await inter.followup.send("⏭ Skipped.")
 
 @bot.tree.command(name="previous", description="Play the previous song")
 async def previous(inter: discord.Interaction):
@@ -386,7 +394,7 @@ async def previous(inter: discord.Interaction):
     prev = music_history.pop(0)
     music_queue.insert(0, prev)
     voice_client.stop()
-    await inter.followup.send("⏮ Playing previous track.", ephemeral=False)
+    await inter.followup.send("⏮ Playing previous track.")
 
 @bot.tree.command(name="pauseplay", description="Toggle pause/play")
 async def pauseplay(inter: discord.Interaction):
@@ -395,14 +403,14 @@ async def pauseplay(inter: discord.Interaction):
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if voice_client.is_playing():
         voice_client.pause()
-        return await inter.followup.send("⏸ Paused.", ephemeral=False)
+        return await inter.followup.send("⏸ Paused.")
     if voice_client.is_paused():
         voice_client.resume()
-        return await inter.followup.send("▶ Resumed.", ephemeral=False)
+        return await inter.followup.send("▶ Resumed.")
     if music_queue:
         await _play_next()
-        return await inter.followup.send("▶ Started playing.", ephemeral=False)
-    await inter.followup.send("🚫 Nothing in queue.", ephemeral=True)
+        return await inter.followup.send("▶ Started playing.")
+    await inter.followup.send("🚫 Nothing in queue.")
 
 @bot.tree.command(name="queue", description="Display the current queue")
 async def queue_cmd(inter: discord.Interaction):
@@ -411,8 +419,7 @@ async def queue_cmd(inter: discord.Interaction):
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not music_queue:
         return await inter.followup.send("📭 Queue is empty.", ephemeral=True)
-    e = make_queue_embed(0)
-    await inter.followup.send(embed=e, view=QueueView())
+    await inter.followup.send(embed=make_queue_embed(), view=QueueView())
 
 @bot.tree.command(name="shuffle", description="Shuffle the queue")
 async def shuffle_cmd(inter: discord.Interaction):
@@ -422,9 +429,9 @@ async def shuffle_cmd(inter: discord.Interaction):
     if not music_queue:
         return await inter.followup.send("📭 Queue is empty.", ephemeral=True)
     random.shuffle(music_queue)
-    await inter.followup.send("🔀 Queue shuffled.", ephemeral=False)
+    await inter.followup.send("🔀 Queue shuffled.")
 
-@bot.tree.command(name="remove", description="Remove a song by its position in the queue")
+@bot.tree.command(name="remove", description="Remove a song by its position")
 @app_commands.describe(position="Position (1‑based)")
 async def remove_cmd(inter: discord.Interaction, position: int):
     await inter.response.defer(ephemeral=True)
@@ -433,12 +440,11 @@ async def remove_cmd(inter: discord.Interaction, position: int):
     if position < 1 or position > len(music_queue):
         return await inter.followup.send("🚫 Invalid position.", ephemeral=True)
     removed = music_queue.pop(position-1)
-    embed = discord.Embed(
+    await inter.followup.send(embed=discord.Embed(
         title="Removed",
         description=f"[{removed['title']}]({removed['webpage_url']})",
         color=discord.Color.blue()
-    )
-    await inter.followup.send(embed=embed, ephemeral=False)
+    ))
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
 async def stop_cmd(inter: discord.Interaction):
@@ -446,61 +452,51 @@ async def stop_cmd(inter: discord.Interaction):
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     clear_all()
-    await inter.followup.send("🛑 Stopped and cleared queue.", ephemeral=False)
+    await inter.followup.send("🛑 Stopped and cleared queue.")
 
-@bot.tree.command(name="addkey", description="Add custom cache entry (query → video)")
+@bot.tree.command(name="addkey", description="Add custom cache entry")
 @app_commands.describe(query="Search key", video_url="YouTube URL")
 async def addkey(inter: discord.Interaction, query: str, video_url: str):
     await inter.response.defer(thinking=True)
     canon = canonical_url(video_url)
     if not canon:
         return await inter.followup.send("🚫 Invalid YouTube URL.", ephemeral=True)
-    raw = await asyncio.to_thread(lambda: YoutubeDL(ydl_opts).extract_info(canon, False))
+    raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(canon, download=False))
     if 'entries' in raw:
         raw = raw['entries'][0]
     info = {
-        'url': raw['url'],
-        'webpage_url': raw['webpage_url'],
-        'title': raw['title'],
-        'duration': raw['duration'],
+        'url': raw['url'], 'webpage_url': raw['webpage_url'],
+        'title': raw['title'], 'duration': raw['duration'],
         'uploader': raw.get('uploader','')
     }
-    entry = None
-    for e in cache_entries:
-        if e['webpage_url'] == info['webpage_url']:
-            e.update(info)
-            entry = e
-            break
-    if not entry:
-        entry = {'keys': [], **info}
+    entry = next((e for e in cache_entries if e['webpage_url']==info['webpage_url']), None)
+    if entry:
+        entry.update(info)
+    else:
+        entry = {'keys':[], **info}
         cache_entries.append(entry)
     lc_q = query.strip().lower()
-    if lc_q not in entry['keys']:
-        entry['keys'].append(lc_q)
-    if canon not in entry['keys']:
-        entry['keys'].append(canon)
+    for k in (lc_q, canon):
+        if k not in entry['keys']:
+            entry['keys'].append(k)
     key_map.clear()
     for e in cache_entries:
-        for k in e['keys']:
-            key_map[k] = e
+        for kk in e['keys']:
+            key_map[kk] = e
     save_cache()
-    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}", ephemeral=False)
+    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}")
 
 @bot.tree.command(name="reloadcache", description="Reload cache from disk")
 async def reloadcache(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
     load_cache()
-    await inter.followup.send("✅ Cache reloaded from disk.", ephemeral=False)
+    await inter.followup.send("✅ Cache reloaded from disk.")
 
 @bot.tree.command(name="exportcache", description="Export cache as JSON (admin only)")
 async def exportcache(inter: discord.Interaction):
     if not inter.user.guild_permissions.administrator:
         return await inter.response.send_message("🚫 Admins only.", ephemeral=True)
-    await inter.response.send_message(
-        "📁 Here is the cache file:",
-        file=discord.File(CACHE_FILE),
-        ephemeral=True
-    )
+    await inter.response.send_message("📁 Here is the cache file:", file=discord.File(CACHE_FILE), ephemeral=True)
 
 @bot.tree.command(name="importcache", description="Import cache from JSON file (admin only)")
 async def importcache(inter: discord.Interaction):
@@ -508,47 +504,33 @@ async def importcache(inter: discord.Interaction):
         return await inter.response.send_message("🚫 Admins only.", ephemeral=True)
     if not inter.attachments:
         return await inter.response.send_message("🚫 Attach a JSON file.", ephemeral=True)
-    att = inter.attachments[0]
-    await inter.response.defer(thinking=True)
-    try:
-        data = json.loads(await att.read())
-    except json.JSONDecodeError as e:
-        return await inter.followup.send(f"🚫 JSON parse error:\n```{e}```", ephemeral=True)
+    data = json.loads(await inter.attachments[0].read())
     if not isinstance(data, list):
-        return await inter.followup.send("🚫 JSON must be a list of entries.", ephemeral=True)
-
+        return await inter.followup.send("🚫 JSON must be a list.", ephemeral=True)
     REQUIRED = {'keys','url','webpage_url','title','duration','uploader'}
     invalid = {}
-    for idx, entry in enumerate(data):
-        if not isinstance(entry, dict):
-            invalid[idx] = "Not an object"; continue
-        if set(entry.keys()) != REQUIRED:
-            invalid[idx] = f"Fields mismatch: {set(entry.keys()).symmetric_difference(REQUIRED)}"; continue
-        info = {f: entry[f] for f in ('url','webpage_url','title','duration','uploader')}
-        merged = None
-        for e in cache_entries:
-            if e['webpage_url'] == info['webpage_url']:
-                e.update(info)
-                merged = e
-                break
-        if not merged:
-            merged = {'keys': [], **info}
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict) or set(entry.keys())!=REQUIRED:
+            invalid[i] = "Fields mismatch"; continue
+        info = {f: entry[f] for f in ['url','webpage_url','title','duration','uploader']}
+        merged = next((e for e in cache_entries if e['webpage_url']==info['webpage_url']), None)
+        if merged:
+            merged.update(info)
+        else:
+            merged = {'keys':[], **info}
             cache_entries.append(merged)
         for k in entry['keys']:
             if k not in merged['keys']:
                 merged['keys'].append(k)
-
     key_map.clear()
     for e in cache_entries:
-        for k in e['keys']:
-            key_map[k] = e
+        for kk in e['keys']:
+            key_map[kk] = e
     save_cache()
-
     if invalid:
-        err = "\n".join(f"Entry {i}: {msg}" for i,msg in invalid.items())
-        await inter.followup.send(f"⚠️ Skipped entries:\n```{err}```", ephemeral=True)
-
-    await inter.followup.send("✅ Cache updated!", ephemeral=False)
+        err = "\n".join(f"Entry {i}: {m}" for i,m in invalid.items())
+        await inter.followup.send(f"⚠️ Skipped:\n```{err}```", ephemeral=True)
+    await inter.followup.send("✅ Cache updated!")
 
 @bot.event
 async def on_ready():
