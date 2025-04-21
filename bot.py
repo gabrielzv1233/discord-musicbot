@@ -4,6 +4,7 @@ import re
 import random
 import asyncio
 from urllib.parse import urlparse, parse_qs
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -15,7 +16,7 @@ USE_CACHE   = True
 CACHE_FILE  = "cache.json"
 
 cache_entries = []
-key_map = {}
+key_map       = {}
 
 def load_cache():
     global cache_entries, key_map
@@ -49,17 +50,18 @@ def save_cache():
 load_cache()
 
 ydl_opts = {
-    'format':           'bestaudio/best',
-    'quiet':            True,
-    'noplaylist':       True,
-    'extract_flat':     False,
-    'forcejson':        True,
+    'format': 'bestaudio[abr<=64]',
+    'quiet': True,
+    'noplaylist': True,
+    'extract_flat': False,
+    'forcejson': True,
     'nocheckcertificate': True,
-    'default_search':   'auto',
-    'source_address':   '0.0.0.0',
-    'geo_bypass':       True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+    'geo_bypass': True,
     'geo_bypass_country': 'US',
 }
+
 url_re = re.compile(r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/')
 
 intents = discord.Intents.default()
@@ -166,8 +168,8 @@ async def _play_next():
     )
     embed.set_author(name="Now Playing", icon_url=item['requester'].avatar.url)
     embed.add_field(name="Requested By", value=item['requester'].mention, inline=True)
-    embed.add_field(name="Duration", value=f"`{format_duration(item['duration'])}`", inline=True)
-    embed.add_field(name="Author", value=f"`{item['uploader']}`", inline=True)
+    embed.add_field(name="Duration",     value=f"`{format_duration(item['duration'])}`", inline=True)
+    embed.add_field(name="Author",       value=f"`{item['uploader']}`", inline=True)
 
     view = NowPlayingView()
     now_playing_msg = await text_channel.send(
@@ -248,9 +250,11 @@ class NowPlayingView(View):
     async def shuffle(self, inter, btn):
         if music_queue:
             random.shuffle(music_queue)
-            await inter.response.send_message("🔀 Queue shuffled.", ephemeral=False)
+            desc = f"@{inter.user.name} shuffled the queue"
         else:
-            await inter.response.send_message("📭 Queue is empty.", ephemeral=True)
+            desc = f"@{inter.user.name} tried to shuffle but the queue is empty"
+        embed = discord.Embed(description=desc, color=discord.Color.blue())
+        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏪ Back", style=discord.ButtonStyle.primary, custom_id="previous")
     async def previous(self, inter, btn):
@@ -258,37 +262,51 @@ class NowPlayingView(View):
             prev = music_history.pop(0)
             music_queue.insert(0, prev)
             voice_client.stop()
-            await inter.response.defer()
+            desc = f"@{inter.user.name} playing previous track: {prev['title']}"
         else:
-            await inter.response.send_message("🚫 No previous track.", ephemeral=True)
+            desc = f"@{inter.user.name} tried to go back but no previous track"
+        embed = discord.Embed(description=desc, color=discord.Color.blue())
+        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏸ Pause", style=discord.ButtonStyle.primary, custom_id="pauseplay")
     async def pauseplay(self, inter, btn):
         if voice_client.is_playing():
             voice_client.pause()
             btn.label = "▶️ Play"
+            desc = f"@{inter.user.name} paused playback"
         elif voice_client.is_paused():
             voice_client.resume()
             btn.label = "⏸ Pause"
+            desc = f"@{inter.user.name} resumed playback"
         elif music_queue:
             await _play_next()
             btn.label = "⏸ Pause"
+            desc = f"@{inter.user.name} started playback"
         else:
-            return await inter.response.send_message("🚫 Nothing to play.", ephemeral=True)
+            desc = f"@{inter.user.name} tried to play but the queue is empty"
+            embed = discord.Embed(description=desc, color=discord.Color.blue())
+            return await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
         await inter.response.edit_message(view=self)
+        embed = discord.Embed(description=desc, color=discord.Color.blue())
+        await inter.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏭ Next", style=discord.ButtonStyle.primary, custom_id="skip")
     async def skip(self, inter, btn):
         if voice_client.is_playing():
             voice_client.stop()
-            await inter.response.defer()
+            desc = f"@{inter.user.name} skipped the track"
         else:
-            await inter.response.send_message("🚫 Nothing is playing.", ephemeral=True)
+            desc = f"@{inter.user.name} tried to skip but nothing is playing"
+        embed = discord.Embed(description=desc, color=discord.Color.blue())
+        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @button(label="⏹ Stop", style=discord.ButtonStyle.danger, custom_id="stop")
     async def stop(self, inter, btn):
         clear_all()
-        await inter.response.send_message("🛑 Stopped and cleared queue.", ephemeral=False)
+        desc = f"@{inter.user.name} stopped playback and cleared the queue"
+        embed = discord.Embed(description=desc, color=discord.Color.blue())
+        await inter.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 class QueueView(View):
     def __init__(self, page=0):
@@ -429,7 +447,7 @@ async def stop_cmd(inter: discord.Interaction):
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     clear_all()
     await inter.followup.send("🛑 Stopped and cleared queue.", ephemeral=False)
-    
+
 @bot.tree.command(name="addkey", description="Add custom cache entry (query → video)")
 @app_commands.describe(query="Search key", video_url="YouTube URL")
 async def addkey(inter: discord.Interaction, query: str, video_url: str):
@@ -441,11 +459,11 @@ async def addkey(inter: discord.Interaction, query: str, video_url: str):
     if 'entries' in raw:
         raw = raw['entries'][0]
     info = {
-        'url':         raw['url'],
+        'url': raw['url'],
         'webpage_url': raw['webpage_url'],
-        'title':       raw['title'],
-        'duration':    raw['duration'],
-        'uploader':    raw.get('uploader','')
+        'title': raw['title'],
+        'duration': raw['duration'],
+        'uploader': raw.get('uploader','')
     }
     entry = None
     for e in cache_entries:
