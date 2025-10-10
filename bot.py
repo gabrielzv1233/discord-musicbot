@@ -1,21 +1,13 @@
-import os
-import re
-import json
-import random
-import asyncio
-
-import aiohttp
-import discord
-from discord import app_commands
-from discord.ext import commands
+import aiohttp, asyncio, discord, random, json, re, os
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
+from discord import app_commands
+from discord.ext import commands
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
 
 TOKEN = "bot token"
-USE_CACHE = True
 CACHE_FILE = "cache.json"
+USE_CACHE = True
 
 cache_entries: list[dict] = []
 key_map: dict[str, dict] = {}
@@ -351,7 +343,7 @@ class NowPlayingView(View):
         else:
             return await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} tried to play but queue empty", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
         await inter.response.edit_message(view=self)
-        await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
+        await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
 
     @button(label="⏭ Next", style=discord.ButtonStyle.primary, custom_id="skip")
     async def skip(self, inter: discord.Interaction, _):
@@ -432,12 +424,7 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
         else:
             asyncio.create_task(_prefetch_next(2))
 
-        await inter.followup.send(embed=discord.Embed(
-            title=f"Added to Queue #{pos}",
-            description=f"[{item['title']}]({item['webpage_url']}) "
-                        f"`{format_duration(item['duration'])}`",
-            color=discord.Color.blue()
-        ))
+        await inter.followup.send(embed=discord.Embed(title=f"Added to Queue #{pos}", description=f"[{item['title']}]({item['webpage_url']}) " f"`{format_duration(item['duration'])}`", color=discord.Color.blue()), ephemeral=False)
     except Exception as e:
         await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
 
@@ -445,7 +432,7 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
 async def join(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
     if await ensure_voice(inter):
-        await inter.followup.send("✅ Joined your voice channel.")
+        await inter.followup.send("✅ Joined your voice channel.", ephemeral=False)
 
 @bot.tree.command(name="play", description="Add a song to the queue")
 @app_commands.describe(query="YouTube URL or search terms")
@@ -471,7 +458,7 @@ async def skip(inter: discord.Interaction):
     if not voice_client.is_playing():
         return await inter.followup.send("⏭ Nothing is playing.", ephemeral=True)
     voice_client.stop()
-    await inter.followup.send("⏭ Skipped.")
+    await inter.followup.send("⏭ Skipped.", ephemeral=False)
 
 @bot.tree.command(name="previous", description="Play the previous song")
 async def previous(inter: discord.Interaction):
@@ -480,7 +467,7 @@ async def previous(inter: discord.Interaction):
         return await inter.followup.send("🚫 No previous track.", ephemeral=True)
     music_queue.insert(0, music_history.pop(0))
     voice_client.stop()
-    await inter.followup.send("⏮ Playing previous track.")
+    await inter.followup.send("⏮ Playing previous track.", ephemeral=False)
 
 @bot.tree.command(name="pauseplay", description="Toggle pause/play")
 async def pauseplay(inter: discord.Interaction):
@@ -489,13 +476,13 @@ async def pauseplay(inter: discord.Interaction):
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if voice_client.is_playing():
         voice_client.pause()
-        return await inter.followup.send("⏸ Paused.")
+        return await inter.followup.send("⏸ Paused.", ephemeral=False)
     if voice_client.is_paused():
         voice_client.resume()
-        return await inter.followup.send("▶ Resumed.")
+        return await inter.followup.send("▶ Resumed.", ephemeral=False)
     if music_queue:
         await _play_next()
-        return await inter.followup.send("▶ Started playing.")
+        return await inter.followup.send("▶ Started playing.", ephemeral=False)
     await inter.followup.send("🚫 Nothing in queue.")
 
 @bot.tree.command(name="queue", description="Display the current queue")
@@ -505,7 +492,7 @@ async def queue_cmd(inter: discord.Interaction):
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not music_queue:
         return await inter.followup.send("📭 Queue is empty.", ephemeral=True)
-    await inter.followup.send(embed=make_queue_embed(), view=QueueView())
+    await inter.followup.send(embed=make_queue_embed(), view=QueueView(), ephemeral=False)
 
 @bot.tree.command(name="shuffle", description="Shuffle the queue")
 async def shuffle_cmd(inter: discord.Interaction):
@@ -515,7 +502,7 @@ async def shuffle_cmd(inter: discord.Interaction):
     if not music_queue:
         return await inter.followup.send("📭 Queue is empty.", ephemeral=True)
     random.shuffle(music_queue)
-    await inter.followup.send("🔀 Queue shuffled.")
+    await inter.followup.send("🔀 Queue shuffled.", ephemeral=False)
 
 @bot.tree.command(name="remove", description="Remove a song by its position")
 @app_commands.describe(position="Position (1-based)")
@@ -526,11 +513,7 @@ async def remove_cmd(inter: discord.Interaction, position: int):
     if position < 1 or position > len(music_queue):
         return await inter.followup.send("🚫 Invalid position.", ephemeral=True)
     removed = music_queue.pop(position - 1)
-    await inter.followup.send(embed=discord.Embed(
-        title="Removed",
-        description=f"[{removed['title']}]({removed['webpage_url']})",
-        color=discord.Color.blue(),
-    ))
+    await inter.followup.send(embed=discord.Embed(title="Removed", description=f"[{removed['title']}]({removed['webpage_url']})", color=discord.Color.blue(), ephemeral=False))
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
 async def stop_cmd(inter: discord.Interaction):
@@ -538,7 +521,7 @@ async def stop_cmd(inter: discord.Interaction):
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     clear_all()
-    await inter.followup.send("🛑 Stopped and cleared queue.")
+    await inter.followup.send("🛑 Stopped and cleared queue.", ephemeral=False)
 
 @bot.tree.command(name="addkey", description="Add custom cache entry")
 @app_commands.describe(query="Search key", video_url="YouTube URL")
@@ -566,13 +549,13 @@ async def addkey(inter: discord.Interaction, query: str, video_url: str):
         for kk in e["keys"]:
             key_map[kk] = e
     save_cache()
-    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}")
+    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}", ephemeral=False)
 
 @bot.tree.command(name="reloadcache", description="Reload cache from disk")
 async def reloadcache(inter: discord.Interaction):
     await inter.response.defer(thinking=True)
     load_cache()
-    await inter.followup.send("✅ Cache reloaded from disk.")
+    await inter.followup.send("✅ Cache reloaded from disk.", ephemeral=False)
 
 @bot.tree.command(name="exportcache", description="Export cache as JSON (admin only)")
 async def exportcache(inter: discord.Interaction):
@@ -613,7 +596,7 @@ async def importcache(inter: discord.Interaction):
     if invalid:
         err = "\n".join(f"Entry {i}: {m}" for i, m in invalid.items())
         await inter.followup.send(f"⚠️ Skipped:\n```{err}```", ephemeral=True)
-    await inter.followup.send("✅ Cache updated!")
+    await inter.followup.send("✅ Cache updated!", ephemeral=False)
 
 @bot.event
 async def on_ready():
