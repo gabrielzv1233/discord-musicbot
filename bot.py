@@ -307,58 +307,86 @@ def make_queue_embed(page: int = 0) -> discord.Embed:
     return e
 
 class NowPlayingView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
     @button(label="🔀 Shuffle", style=discord.ButtonStyle.primary, custom_id="shuffle")
-    async def shuffle(self, inter: discord.Interaction, _):
-        if music_queue:
-            random.shuffle(music_queue)
-            desc = f"{inter.user.mention} shuffled the queue"
-        else:
-            desc = f"{inter.user.mention} tried to shuffle but queue empty"
-        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+    async def shuffle(self, inter: discord.Interaction, _btn: Button):
+        try:
+            if music_queue:
+                random.shuffle(music_queue)
+                desc = f"{inter.user.mention} shuffled the queue"
+            else:
+                desc = f"{inter.user.mention} tried to shuffle but queue empty"
+            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+        except Exception as e:
+            await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏮️ Back", style=discord.ButtonStyle.primary, custom_id="previous")
-    async def previous(self, inter: discord.Interaction, _):
-        if music_history:
-            prev = music_history.pop(0)
-            music_queue.insert(0, prev)
-            voice_client.stop()
-            desc = f"{inter.user.mention} playing previous track: {prev['title']}"
-        else:
-            desc = f"{inter.user.mention} tried to go back but none"
-        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
+    async def previous(self, inter: discord.Interaction, _btn: Button):
+        try:
+            if music_history and voice_client and voice_client.is_connected():
+                prev = music_history.pop(0)
+                music_queue.insert(0, prev)
+                voice_client.stop()
+                desc = f"{inter.user.mention} playing previous track: {prev['title']}"
+            else:
+                desc = f"{inter.user.mention} tried to go back but none"
+            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏸ Pause", style=discord.ButtonStyle.primary, custom_id="pauseplay")
     async def pauseplay(self, inter: discord.Interaction, btn: Button):
-        if voice_client.is_playing():
-            voice_client.pause()
-            btn.label = "▶️ Play"
-            desc = f"{inter.user.mention} paused playback"
-        elif voice_client.is_paused():
-            voice_client.resume()
-            btn.label = "⏸ Pause"
-            desc = f"{inter.user.mention} resumed playback"
-        elif music_queue:
-            await _play_next()
-            desc = f"{inter.user.mention} started playback"
-        else:
-            return await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} tried to play but queue empty", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
-        await inter.response.edit_message(view=self)
-        await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+        try:
+            if not voice_client or not voice_client.is_connected():
+                return await inter.response.send_message("🚫 I'm not in a voice channel.", ephemeral=True)
+
+            if voice_client.is_playing():
+                voice_client.pause()
+                btn.label = "▶️ Play"
+                desc = f"{inter.user.mention} paused playback"
+                await inter.response.edit_message(view=self)
+                return await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+
+            if voice_client.is_paused():
+                voice_client.resume()
+                btn.label = "⏸ Pause"
+                desc = f"{inter.user.mention} resumed playback"
+                await inter.response.edit_message(view=self)
+                return await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+
+            if music_queue:
+                await _play_next()
+                return await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} started playback", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+
+            await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} tried to play but queue empty", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+        except Exception as e:
+            if not inter.response.is_done():
+                await inter.response.send_message(f"🚫 {e}", ephemeral=True)
+            else:
+                await inter.followup.send(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏭ Next", style=discord.ButtonStyle.primary, custom_id="skip")
-    async def skip(self, inter: discord.Interaction, _):
-        if voice_client.is_playing():
-            voice_client.stop()
-            desc = f"{inter.user.mention} skipped the track"
-        else:
-            desc = f"{inter.user.mention} tried to skip but nothing is playing"
-        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
+    async def skip(self, inter: discord.Interaction, _btn: Button):
+        try:
+            if voice_client and voice_client.is_playing():
+                voice_client.stop()
+                desc = f"{inter.user.mention} skipped the track"
+            else:
+                desc = f"{inter.user.mention} tried to skip but nothing is playing"
+            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+        except Exception as e:
+            await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏹ Stop", style=discord.ButtonStyle.danger, custom_id="stop")
-    async def stop(self, inter: discord.Interaction, _):
-        clear_all()
-        desc = f"{inter.user.mention} stopped playback and cleared the queue"
-        await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
+    async def stop(self, inter: discord.Interaction, _btn: Button):
+        try:
+            clear_all()
+            desc = f"{inter.user.mention} stopped playback and cleared the queue"
+            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+        except Exception as e:
+            await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
 class QueueView(View):
     def __init__(self, page: int = 0):
