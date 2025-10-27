@@ -1,3 +1,5 @@
+# https://spotify.link/SSApwttwwXb fix links using that format ?
+# add /nowplaying too refresh the now playing embed
 import aiohttp, asyncio, discord, random, json, re, os
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
@@ -456,16 +458,55 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
     except Exception as e:
         await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
 
+@bot.tree.command(name="nowplaying", description="Refresh the Now Playing message")
+async def nowplaying_cmd(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+
+    if not voice_client or not voice_client.is_connected():
+        return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
+
+    if not (voice_client.is_playing() or voice_client.is_paused()) or not music_history:
+        return await inter.followup.send("🚫 Nothing is currently playing.", ephemeral=True)
+
+    item = music_history[0]
+
+    global now_playing_msg
+    if now_playing_msg:
+        try:
+            await now_playing_msg.delete()
+        except discord.HTTPException:
+            pass
+
+    embed = (
+        discord.Embed(
+            title="Now Playing",
+            description=f"[{item['title']}]({item['webpage_url']}) ",
+            color=discord.Color.blue(),
+        )
+        .set_author(name="Now Playing", icon_url=item["requester"].display_avatar.url)
+        .add_field(name="Requested By", value=item["requester"].mention, inline=True)
+        .add_field(name="Duration", value=f"`{format_duration(item['duration'])}`", inline=True)
+        .add_field(name="Author", value=f"`{item['uploader']}`", inline=True)
+    )
+
+    now_playing_msg = await inter.channel.send(
+        embed=embed,
+        view=NowPlayingView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    await inter.followup.send("✅ Refreshed.", ephemeral=True)
+
 @bot.tree.command(name="join", description="Join your voice channel")
 async def join(inter: discord.Interaction):
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if await ensure_voice(inter):
         await inter.followup.send("✅ Joined your voice channel.", ephemeral=False)
 
 @bot.tree.command(name="play", description="Add a song to the queue")
 @app_commands.describe(query="YouTube URL or search terms")
 async def play(inter: discord.Interaction, query: str):
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
         return
     asyncio.create_task(_handle_add(inter, query, False))
@@ -473,7 +514,7 @@ async def play(inter: discord.Interaction, query: str):
 @bot.tree.command(name="next", description="Add a song next in queue")
 @app_commands.describe(query="YouTube URL or search terms")
 async def play_next_cmd(inter: discord.Interaction, query: str):
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
         return
     asyncio.create_task(_handle_add(inter, query, True))
@@ -515,7 +556,7 @@ async def pauseplay(inter: discord.Interaction):
 
 @bot.tree.command(name="queue", description="Display the current queue")
 async def queue_cmd(inter: discord.Interaction):
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not music_queue:
@@ -524,7 +565,7 @@ async def queue_cmd(inter: discord.Interaction):
 
 @bot.tree.command(name="shuffle", description="Shuffle the queue")
 async def shuffle_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(ephemeral=True, emphemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not music_queue:
@@ -541,11 +582,16 @@ async def remove_cmd(inter: discord.Interaction, position: int):
     if position < 1 or position > len(music_queue):
         return await inter.followup.send("🚫 Invalid position.", ephemeral=True)
     removed = music_queue.pop(position - 1)
-    await inter.followup.send(embed=discord.Embed(title="Removed", description=f"[{removed['title']}]({removed['webpage_url']})", color=discord.Color.blue(), ephemeral=False))
+    embed = discord.Embed(
+        title="Removed",
+        description=f"[{removed['title']}]({removed['webpage_url']})",
+        color=discord.Color.blue()
+    )
+    await inter.followup.send(embed=embed, ephemeral=False)
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
 async def stop_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(ephemeral=True, emphemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     clear_all()
@@ -554,7 +600,7 @@ async def stop_cmd(inter: discord.Interaction):
 @bot.tree.command(name="addkey", description="Add custom cache entry")
 @app_commands.describe(query="Search key", video_url="YouTube URL")
 async def addkey(inter: discord.Interaction, query: str, video_url: str):
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     canon = canonical_url(video_url)
     if not canon:
         return await inter.followup.send("🚫 Invalid YouTube URL.", ephemeral=True)
@@ -581,7 +627,7 @@ async def addkey(inter: discord.Interaction, query: str, video_url: str):
 
 @bot.tree.command(name="reloadcache", description="Reload cache from disk")
 async def reloadcache(inter: discord.Interaction):
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     load_cache()
     await inter.followup.send("✅ Cache reloaded from disk.", ephemeral=False)
 
