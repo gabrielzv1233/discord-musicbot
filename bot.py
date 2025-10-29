@@ -460,7 +460,7 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
 
 @bot.tree.command(name="nowplaying", description="Refresh the Now Playing message")
 async def nowplaying_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
 
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
@@ -521,7 +521,7 @@ async def play_next_cmd(inter: discord.Interaction, query: str):
 
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not voice_client.is_playing():
@@ -531,7 +531,7 @@ async def skip(inter: discord.Interaction):
 
 @bot.tree.command(name="previous", description="Play the previous song")
 async def previous(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not music_history:
         return await inter.followup.send("🚫 No previous track.", ephemeral=True)
     music_queue.insert(0, music_history.pop(0))
@@ -540,7 +540,7 @@ async def previous(inter: discord.Interaction):
 
 @bot.tree.command(name="pauseplay", description="Toggle pause/play")
 async def pauseplay(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if voice_client.is_playing():
@@ -565,7 +565,7 @@ async def queue_cmd(inter: discord.Interaction):
 
 @bot.tree.command(name="shuffle", description="Shuffle the queue")
 async def shuffle_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True, emphemeral=False)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not music_queue:
@@ -576,7 +576,7 @@ async def shuffle_cmd(inter: discord.Interaction):
 @bot.tree.command(name="remove", description="Remove a song by its position")
 @app_commands.describe(position="Position (1-based)")
 async def remove_cmd(inter: discord.Interaction, position: int):
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if position < 1 or position > len(music_queue):
@@ -591,7 +591,7 @@ async def remove_cmd(inter: discord.Interaction, position: int):
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
 async def stop_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True, emphemeral=False)
+    await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     clear_all()
