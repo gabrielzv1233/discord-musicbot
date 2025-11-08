@@ -8,8 +8,9 @@ from discord.ext import commands
 from yt_dlp import YoutubeDL
 
 TOKEN = "bot token"
-CACHE_FILE = "cache.json"
-USE_CACHE = True
+CACHE_FILE = "cache.json" # Json file to store cache
+OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
+USE_CACHE = True # Disabling bypasses cache entirely
 
 cache_entries: list[dict] = []
 key_map: dict[str, dict] = {}
@@ -597,9 +598,34 @@ async def stop_cmd(inter: discord.Interaction):
     clear_all()
     await inter.followup.send("🛑 Stopped and cleared queue.", ephemeral=False)
 
+async def check_permission(inter: discord.Interaction, OWNER_ONLY: bool):
+    app_info = await inter.client.application_info()
+
+    if OWNER_ONLY:
+        allowed_ids = set()
+
+        if app_info.owner:
+            allowed_ids.add(app_info.owner.id)
+
+        if hasattr(app_info, "team") and app_info.team:
+            allowed_ids.update(m.id for m in app_info.team.members)
+
+        if inter.user.id not in allowed_ids:
+            await inter.response.send_message("🚫 Only the bot owner can run this.", ephemeral=True)
+            return False
+    else:
+        if not inter.user.guild_permissions.administrator:
+            await inter.response.send_message("🚫 Admins only.", ephemeral=True)
+            return False
+        
+    return True
+
 @bot.tree.command(name="addkey", description="Add custom cache entry")
 @app_commands.describe(query="Search key", video_url="YouTube URL")
 async def addkey(inter: discord.Interaction, query: str, video_url: str):
+    if not await check_permission(inter, OWNER_ONLY=True):
+        return
+    
     await inter.response.defer(thinking=True, ephemeral=False)
     canon = canonical_url(video_url)
     if not canon:
@@ -623,35 +649,52 @@ async def addkey(inter: discord.Interaction, query: str, video_url: str):
         for kk in e["keys"]:
             key_map[kk] = e
     save_cache()
-    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}", ephemeral=False)
+    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}", ephemeral=OWNER_ONLY)
 
 @bot.tree.command(name="reloadcache", description="Reload cache from disk")
 async def reloadcache(inter: discord.Interaction):
+    if not await check_permission(inter, OWNER_ONLY=True):
+        return
+    
     await inter.response.defer(thinking=True, ephemeral=False)
     load_cache()
-    await inter.followup.send("✅ Cache reloaded from disk.", ephemeral=False)
+    await inter.followup.send("✅ Cache reloaded from disk.", ephemeral=OWNER_ONLY)
 
 @bot.tree.command(name="exportcache", description="Export cache as JSON (admin only)")
 async def exportcache(inter: discord.Interaction):
-    if not inter.user.guild_permissions.administrator:
-        return await inter.response.send_message("🚫 Admins only.", ephemeral=True)
+    if not await check_permission(inter, OWNER_ONLY=True):
+        return
+    
     await inter.response.send_message("📁 Here is the cache file:", file=discord.File(CACHE_FILE), ephemeral=True)
 
 @bot.tree.command(name="importcache", description="Import cache from JSON file (admin only)")
-async def importcache(inter: discord.Interaction):
-    if not inter.user.guild_permissions.administrator:
-        return await inter.response.send_message("🚫 Admins only.", ephemeral=True)
-    if not inter.attachments:
+@app_commands.describe(file="Upload the JSON cache export")
+async def importcache(inter: discord.Interaction, file: discord.Attachment):
+    if not await check_permission(inter, OWNER_ONLY=True):
+        return
+
+    if file is None:
         return await inter.response.send_message("🚫 Attach a JSON file.", ephemeral=True)
-    data = json.loads(await inter.attachments[0].read())
+
+    await inter.response.defer()
+
+    try:
+        raw = await file.read()
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
+    except Exception as e:
+        return await inter.followup.send(f"🚫 Failed to read JSON: {e}", ephemeral=True)
+
     if not isinstance(data, list):
         return await inter.followup.send("🚫 JSON must be a list.", ephemeral=True)
+
     REQUIRED = {"keys", "url", "webpage_url", "title", "duration", "uploader"}
     invalid = {}
+
     for i, entry in enumerate(data):
         if not isinstance(entry, dict) or set(entry.keys()) != REQUIRED:
             invalid[i] = "Fields mismatch"
             continue
+
         info = {f: entry[f] for f in ("url", "webpage_url", "title", "duration", "uploader")}
         merged = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
         if merged:
@@ -659,19 +702,25 @@ async def importcache(inter: discord.Interaction):
         else:
             merged = {"keys": [], **info}
             cache_entries.append(merged)
+
         for k in entry["keys"]:
             if k not in merged["keys"]:
                 merged["keys"].append(k)
+
     key_map.clear()
     for e in cache_entries:
         for kk in e["keys"]:
             key_map[kk] = e
+
     save_cache()
+
+    msg = "✅ Cache updated!"
     if invalid:
         err = "\n".join(f"Entry {i}: {m}" for i, m in invalid.items())
-        await inter.followup.send(f"⚠️ Skipped:\n```{err}```", ephemeral=True)
-    await inter.followup.send("✅ Cache updated!", ephemeral=False)
+        msg += f"\n⚠️ Skipped:\n```{err}```"
 
+    await inter.followup.send(msg, ephemeral=OWNER_ONLY)
+    
 @bot.event
 async def on_ready():
     await bot.tree.sync()
