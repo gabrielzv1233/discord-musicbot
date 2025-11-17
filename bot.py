@@ -1,5 +1,3 @@
-# https://spotify.link/SSApwttwwXb fix links using that format ?
-# add /nowplaying too refresh the now playing embed
 import aiohttp, asyncio, discord, random, json, re, os
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
@@ -70,7 +68,7 @@ ydl_opts = {
     "concurrent_fragment_downloads": 1,
     "skip_download": True
 }
-if os.path.exists(cookiefile):
+if os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0:
     ydl_opts["cookiefile"] = cookiefile
 
 stream_ydl = YoutubeDL(ydl_opts)
@@ -155,10 +153,24 @@ def clear_all():
 async def auto_disconnect():
     global voice_client, disconnect_task
     await asyncio.sleep(300)
-    if voice_client and voice_client.is_connected():
-        if not voice_client.is_playing() and not voice_client.is_paused() and not music_queue:
-            await voice_client.disconnect()
-            clear_all()
+
+    if not voice_client or not voice_client.is_connected():
+        return
+
+    channel = voice_client.channel
+    non_bot_members = []
+    if channel:
+        non_bot_members = [m for m in channel.members if not m.bot]
+
+    if not non_bot_members and voice_client.is_paused():
+        await voice_client.disconnect()
+        clear_all()
+        return
+
+    if not voice_client.is_playing() and not voice_client.is_paused() and not music_queue:
+        await voice_client.disconnect()
+        clear_all()
+
 
 def _arm_idle_timer():
     global disconnect_task
@@ -321,7 +333,11 @@ class NowPlayingView(View):
                 desc = f"{inter.user.mention} shuffled the queue"
             else:
                 desc = f"{inter.user.mention} tried to shuffle but queue empty"
-            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+            await inter.response.send_message(
+                embed=discord.Embed(description=desc, color=discord.Color.blue()),
+                allowed_mentions=discord.AllowedMentions.none(),
+                ephemeral=False
+            )
         except Exception as e:
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
@@ -332,10 +348,22 @@ class NowPlayingView(View):
                 prev = music_history.pop(0)
                 music_queue.insert(0, prev)
                 voice_client.stop()
-                desc = f"{inter.user.mention} playing previous track: {prev['title']}"
+                await inter.response.send_message(
+                    embed=discord.Embed(
+                        title="⏮ Playing Previous Track",
+                        description=f"[{prev['title']}]({prev['webpage_url']})",
+                        color=discord.Color.blue()
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
             else:
-                desc = f"{inter.user.mention} tried to go back but none"
-            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none())
+                await inter.response.send_message(
+                    embed=discord.Embed(
+                        description=f"{inter.user.mention} tried to go back but none",
+                        color=discord.Color.blue()
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
         except Exception as e:
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
@@ -348,22 +376,43 @@ class NowPlayingView(View):
             if voice_client.is_playing():
                 voice_client.pause()
                 btn.label = "▶️ Play"
-                desc = f"{inter.user.mention} paused playback"
+                _arm_idle_timer()  # start 5-minute timer
                 await inter.response.edit_message(view=self)
-                return await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+                return await inter.followup.send(
+                    embed=discord.Embed(description=f"{inter.user.mention} paused playback", color=discord.Color.blue()),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    ephemeral=False
+                )
 
             if voice_client.is_paused():
                 voice_client.resume()
                 btn.label = "⏸ Pause"
-                desc = f"{inter.user.mention} resumed playback"
                 await inter.response.edit_message(view=self)
-                return await inter.followup.send(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+                return await inter.followup.send(
+                    embed=discord.Embed(description=f"{inter.user.mention} resumed playback", color=discord.Color.blue()),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    ephemeral=False
+                )
 
             if music_queue:
                 await _play_next()
-                return await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} started playback", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+                return await inter.response.send_message(
+                    embed=discord.Embed(description=f"{inter.user.mention} started playback", color=discord.Color.blue()),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    ephemeral=False
+                )
 
-            await inter.response.send_message(embed=discord.Embed(description=f"{inter.user.mention} tried to play but queue empty", color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+            await inter.response.send_message(
+                embed=discord.Embed(description=f"{inter.user.mention} tried to play but queue empty", color=discord.Color.blue()),
+                allowed_mentions=discord.AllowedMentions.none(),
+                ephemeral=False
+            )
+        except Exception as e:
+            if not inter.response.is_done():
+                await inter.response.send_message(f"🚫 {e}", ephemeral=True)
+            else:
+                await inter.followup.send(f"🚫 {e}", ephemeral=True)
+
         except Exception as e:
             if not inter.response.is_done():
                 await inter.response.send_message(f"🚫 {e}", ephemeral=True)
@@ -373,12 +422,37 @@ class NowPlayingView(View):
     @button(label="⏭ Next", style=discord.ButtonStyle.primary, custom_id="skip")
     async def skip(self, inter: discord.Interaction, _btn: Button):
         try:
-            if voice_client and voice_client.is_playing():
+            if voice_client and voice_client.is_connected() and (voice_client.is_playing() or voice_client.is_paused()):
+                current = music_history[0] if music_history else None
                 voice_client.stop()
-                desc = f"{inter.user.mention} skipped the track"
+                if current:
+                    await inter.response.send_message(
+                        embed=discord.Embed(
+                            title="⏭ Skipped",
+                            description=f"[{current['title']}]({current['webpage_url']})",
+                            color=discord.Color.blue()
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        ephemeral=False
+                    )
+                else:
+                    await inter.response.send_message(
+                        embed=discord.Embed(
+                            description=f"{inter.user.mention} skipped the track",
+                            color=discord.Color.blue()
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        ephemeral=False
+                    )
             else:
-                desc = f"{inter.user.mention} tried to skip but nothing is playing"
-            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+                await inter.response.send_message(
+                    embed=discord.Embed(
+                        description=f"{inter.user.mention} tried to skip but nothing is playing",
+                        color=discord.Color.blue()
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    ephemeral=False
+                )
         except Exception as e:
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
@@ -386,8 +460,14 @@ class NowPlayingView(View):
     async def stop(self, inter: discord.Interaction, _btn: Button):
         try:
             clear_all()
-            desc = f"{inter.user.mention} stopped playback and cleared the queue"
-            await inter.response.send_message(embed=discord.Embed(description=desc, color=discord.Color.blue()), allowed_mentions=discord.AllowedMentions.none(), ephemeral=False)
+            await inter.response.send_message(
+                embed=discord.Embed(
+                    description=f"{inter.user.mention} stopped playback and cleared the queue",
+                    color=discord.Color.blue()
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+                ephemeral=False
+            )
         except Exception as e:
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
@@ -525,36 +605,65 @@ async def skip(inter: discord.Interaction):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
-    if not voice_client.is_playing():
+    if not (voice_client.is_playing() or voice_client.is_paused()):
         return await inter.followup.send("⏭ Nothing is playing.", ephemeral=True)
+
+    current = music_history[0] if music_history else None
     voice_client.stop()
+
+    if current:
+        return await inter.followup.send(
+            embed=discord.Embed(
+                title="⏭ Skipped",
+                description=f"[{current['title']}]({current['webpage_url']})",
+                color=discord.Color.blue()
+            ),
+            ephemeral=False
+        )
     await inter.followup.send("⏭ Skipped.", ephemeral=False)
 
 @bot.tree.command(name="previous", description="Play the previous song")
 async def previous(inter: discord.Interaction):
     await inter.response.defer(thinking=True, ephemeral=False)
+    if not voice_client or not voice_client.is_connected():
+        return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
     if not music_history:
         return await inter.followup.send("🚫 No previous track.", ephemeral=True)
-    music_queue.insert(0, music_history.pop(0))
+
+    prev = music_history.pop(0)
+    music_queue.insert(0, prev)
     voice_client.stop()
-    await inter.followup.send("⏮ Playing previous track.", ephemeral=False)
+
+    await inter.followup.send(
+        embed=discord.Embed(
+            title="⏮ Playing Previous Track",
+            description=f"[{prev['title']}]({prev['webpage_url']})",
+            color=discord.Color.blue()
+        ),
+        ephemeral=False
+    )
 
 @bot.tree.command(name="pauseplay", description="Toggle pause/play")
 async def pauseplay(inter: discord.Interaction):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
+
     if voice_client.is_playing():
         voice_client.pause()
+        _arm_idle_timer()
         return await inter.followup.send("⏸ Paused.", ephemeral=False)
+
     if voice_client.is_paused():
         voice_client.resume()
         return await inter.followup.send("▶ Resumed.", ephemeral=False)
+
     if music_queue:
         await _play_next()
         return await inter.followup.send("▶ Started playing.", ephemeral=False)
-    await inter.followup.send("🚫 Nothing in queue.")
 
+    await inter.followup.send("🚫 Nothing in queue.")
+        
 @bot.tree.command(name="queue", description="Display the current queue")
 async def queue_cmd(inter: discord.Interaction):
     await inter.response.defer(thinking=True, ephemeral=False)
@@ -732,8 +841,18 @@ async def on_disconnect():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    global music_queue, music_history, voice_client
+
     if member == bot.user and before.channel and not after.channel:
         music_queue.clear()
         music_history.clear()
+        return
+
+    if voice_client and before.channel == voice_client.channel and after.channel != voice_client.channel:
+        channel = voice_client.channel
+        if channel:
+            non_bot_members = [m for m in channel.members if not m.bot]
+            if not non_bot_members and voice_client.is_paused():
+                _arm_idle_timer()
 
 bot.run(TOKEN)
