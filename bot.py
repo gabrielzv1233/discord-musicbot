@@ -1,9 +1,33 @@
-import aiohttp, asyncio, discord, random, json, re, os
+import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
 from discord import app_commands
 from discord.ext import commands
-from yt_dlp import YoutubeDL
+
+def ytdlp_updated() -> bool:
+    try:
+        local = importlib.metadata.version("yt-dlp")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+    resp = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=5)
+    resp.raise_for_status()
+    latest = resp.json()["info"]["version"]
+
+    return local == latest, local, latest
+
+try:
+    updated, localver, latestver = ytdlp_updated()
+    if not updated:
+        print(f"Updating yt-dlp from {localver} to {latestver}...")
+        os.system("python -m pip install -U yt-dlp")
+    else:
+        print(f"yt-dlp runnning {localver} (up to date)")
+
+    from yt_dlp import YoutubeDL
+
+except Exception as e:
+    print(f"Failed to check/update yt-dlp: {e}")
 
 TOKEN = "bot token"
 CACHE_FILE = "cache.json" # Json file to store cache
