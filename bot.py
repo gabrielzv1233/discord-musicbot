@@ -143,12 +143,32 @@ async def ensure_voice(inter: discord.Interaction) -> bool:
 
 def clear_all():
     global music_queue, music_history, voice_client, now_playing_msg
+
+    vc = voice_client
+    msg = now_playing_msg
+
     music_queue.clear()
     music_history.clear()
-    if voice_client and voice_client.is_connected():
-        asyncio.create_task(voice_client.disconnect())
     voice_client = None
     now_playing_msg = None
+
+    if vc and vc.is_connected():
+        async def _disc(v: discord.VoiceClient):
+            try:
+                await v.disconnect()
+            except discord.HTTPException as e:
+                print(f"Failed to disconnect: {e}")
+
+        asyncio.create_task(_disc(vc))
+
+    if msg:
+        async def _delete_msg(m: discord.Message):
+            try:
+                await m.delete()
+            except discord.HTTPException as e:
+                print(f"Failed to delete now playing message: {e}")
+
+        asyncio.create_task(_delete_msg(msg))
 
 async def auto_disconnect():
     global voice_client, disconnect_task
@@ -163,14 +183,11 @@ async def auto_disconnect():
         non_bot_members = [m for m in channel.members if not m.bot]
 
     if not non_bot_members and voice_client.is_paused():
-        await voice_client.disconnect()
         clear_all()
         return
 
     if not voice_client.is_playing() and not voice_client.is_paused() and not music_queue:
-        await voice_client.disconnect()
         clear_all()
-
 
 def _arm_idle_timer():
     global disconnect_task
@@ -758,7 +775,7 @@ async def addkey(inter: discord.Interaction, query: str, video_url: str):
         for kk in e["keys"]:
             key_map[kk] = e
     save_cache()
-    await inter.followup.send(f"✅ Cached `{lc_q}` → {canon}", ephemeral=OWNER_ONLY)
+    await inter.followup.send(f"✅ Cached `{lc_q}` as `{canon}`", ephemeral=OWNER_ONLY)
 
 @bot.tree.command(name="reloadcache", description="Reload cache from disk")
 async def reloadcache(inter: discord.Interaction):
