@@ -73,7 +73,8 @@ if os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0:
 
 stream_ydl = YoutubeDL(ydl_opts)
 search_ydl = YoutubeDL({**ydl_opts, "extract_flat": True})
-url_re = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/")
+url_re = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.IGNORECASE)
+soundcloud_re = re.compile(r"(https?://)?(www\.)?(m\.)?(soundcloud\.com|on\.soundcloud\.com)/", re.IGNORECASE)
 
 intents = discord.Intents.all()
 intents.voice_states = True
@@ -268,9 +269,13 @@ async def _play_next():
                     item[k] = entry[k]
             except Exception:
                 try:
-                    flat = await asyncio.to_thread(lambda: search_ydl.extract_info(f"ytsearch1:{entry['title']}", download=False))
+                    flat = await asyncio.to_thread(
+                        lambda: search_ydl.extract_info(f"ytsearch1:{entry['title']}", download=False)
+                    )
                     vid = flat["entries"][0]["id"]
-                    raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False))
+                    raw = await asyncio.to_thread(
+                        lambda: stream_ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+                    )
                     for k in ("url", "duration", "title", "uploader"):
                         entry[k] = raw.get(k)
                         item[k] = raw.get(k)
@@ -280,10 +285,7 @@ async def _play_next():
 
     def _after_playback(_):
         fut = asyncio.run_coroutine_threadsafe(_play_next(), bot.loop)
-        try:
-            fut.result()
-        except Exception:
-            pass
+        fut.result()
 
     voice_client.play(
         discord.FFmpegPCMAudio(
@@ -298,8 +300,8 @@ async def _play_next():
     if now_playing_msg:
         try:
             await now_playing_msg.delete()
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            print(f"Failed to delete now playing message: {e}")
 
     embed = (
         discord.Embed(
@@ -393,7 +395,7 @@ class NowPlayingView(View):
             if voice_client.is_playing():
                 voice_client.pause()
                 btn.label = "▶️ Play"
-                _arm_idle_timer()  # start 5-minute timer
+                _arm_idle_timer()
                 await inter.response.edit_message(view=self)
                 return await inter.followup.send(
                     embed=discord.Embed(description=f"{inter.user.mention} paused playback", color=discord.Color.blue()),
@@ -509,36 +511,101 @@ class QueueView(View):
         self.prev_page.disabled = self.page == 0
         await inter.response.edit_message(embed=make_queue_embed(self.page), view=self)
 
+async def _extract_soundcloud_info(url: str) -> dict:
+    def _run():
+        with YoutubeDL({
+            "format": "bestaudio/best",
+            "quiet": True,
+            "noplaylist": True,
+            "forcejson": True,
+            "nocheckcertificate": True,
+            "geo_bypass": True,
+            "geo_bypass_country": "US",
+            "skip_download": True
+        }) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    raw = await asyncio.to_thread(_run)
+    if "entries" in raw:
+        raw = raw["entries"][0]
+
+    fmts = raw.get("formats") or []
+    fmt_url = raw.get("url")
+    chosen_headers = raw.get("http_headers") or {}
+
+    if fmts:
+        candidates = [f for f in fmts if f.get("acodec") not in (None, "none")]
+        if not candidates:
+            candidates = fmts
+        best = max(
+            candidates,
+            key=lambda f: (f.get("abr") or f.get("tbr") or 0)
+        )
+        fmt_url = best.get("url") or fmt_url
+        if not chosen_headers:
+            chosen_headers = best.get("http_headers") or chosen_headers
+
+    if not fmt_url:
+        print("SoundCloud extractor got no playable url for:", url)
+        print("Raw info:", raw)
+        raise RuntimeError("No playable audio URL found for this SoundCloud track")
+
+    info = {
+        "url": fmt_url,
+        "webpage_url": raw.get("webpage_url") or url,
+        "title": raw.get("title") or "Unknown title",
+        "duration": raw.get("duration") or 0,
+        "uploader": raw.get("uploader") or raw.get("uploader_id") or "Unknown",
+        "http_headers": chosen_headers,
+    }
+
+    return info
+
+
 async def _handle_add(inter: discord.Interaction, query: str, front: bool):
     try:
-        key = query.strip() if url_re.match(query) else query.strip().lower()
-        if USE_CACHE and key in key_map:
-            entry = key_map[key]
-        else:
-            search_str = query if url_re.match(query) else f"ytsearch1:{query}"
-            raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(search_str, download=False))
-            if "entries" in raw:
-                raw = raw["entries"][0]
-            info = {k: raw.get(k) for k in ("url", "webpage_url", "title", "duration", "uploader")}
-            entry = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
-            if entry:
-                entry.update(info)
-            else:
-                entry = {"keys": [], **info}
-                cache_entries.append(entry)
-            if key not in entry["keys"]:
-                entry["keys"].append(key)
-            canon = canonical_url(info["webpage_url"])
-            if canon and canon not in entry["keys"]:
-                entry["keys"].append(canon)
-            key_map.clear()
-            for e in cache_entries:
-                for k2 in e["keys"]:
-                    key_map[k2] = e
-            save_cache()
+        raw_query = query.strip()
+        is_sc = bool(soundcloud_re.match(raw_query))
 
-        item = {k: entry[k] for k in ("url", "webpage_url", "title", "duration", "uploader")}
-        item["requester"] = inter.user
+        if is_sc:
+            info = await _extract_soundcloud_info(raw_query)
+            entry = info
+        else:
+            key = raw_query if url_re.match(raw_query) else raw_query.lower()
+            if USE_CACHE and key in key_map:
+                entry = key_map[key]
+            else:
+                search_str = raw_query if url_re.match(raw_query) else f"ytsearch1:{query}"
+                raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(search_str, download=False))
+                if "entries" in raw:
+                    raw = raw["entries"][0]
+                info = {k: raw.get(k) for k in ("url", "webpage_url", "title", "duration", "uploader")}
+                entry = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
+                if entry:
+                    entry.update(info)
+                else:
+                    entry = {"keys": [], **info}
+                    cache_entries.append(entry)
+                if USE_CACHE:
+                    if key not in entry["keys"]:
+                        entry["keys"].append(key)
+                    canon = canonical_url(info["webpage_url"])
+                    if canon and canon not in entry["keys"]:
+                        entry["keys"].append(canon)
+                    key_map.clear()
+                    for e in cache_entries:
+                        for k2 in e["keys"]:
+                            key_map[k2] = e
+                    save_cache()
+
+        item = {
+            "url": entry["url"],
+            "webpage_url": entry["webpage_url"],
+            "title": entry["title"],
+            "duration": entry["duration"],
+            "uploader": entry["uploader"],
+            "requester": inter.user
+        }
 
         if front:
             music_queue.insert(0, item)
@@ -547,12 +614,19 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
             music_queue.append(item)
             pos = len(music_queue)
 
-        if pos == 1 and not voice_client.is_playing() and not voice_client.is_paused():
+        if pos == 1 and voice_client and not voice_client.is_playing() and not voice_client.is_paused():
             await _play_next()
         else:
             asyncio.create_task(_prefetch_next(2))
 
-        await inter.followup.send(embed=discord.Embed(title=f"Added to Queue #{pos}", description=f"[{item['title']}]({item['webpage_url']}) " f"`{format_duration(item['duration'])}`", color=discord.Color.blue()), ephemeral=False)
+        await inter.followup.send(
+            embed=discord.Embed(
+                title=f"Added to Queue #{pos}",
+                description=f"[{item['title']}]({item['webpage_url']}) " f"`{format_duration(item['duration'])}`",
+                color=discord.Color.blue()
+            ),
+            ephemeral=False
+        )
     except Exception as e:
         await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
 
@@ -572,8 +646,8 @@ async def nowplaying_cmd(inter: discord.Interaction):
     if now_playing_msg:
         try:
             await now_playing_msg.delete()
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            print(e)
 
     embed = (
         discord.Embed(
@@ -602,7 +676,7 @@ async def join(inter: discord.Interaction):
         await inter.followup.send("✅ Joined your voice channel.", ephemeral=False)
 
 @bot.tree.command(name="play", description="Add a song to the queue")
-@app_commands.describe(query="YouTube URL or search terms")
+@app_commands.describe(query="YouTube URL or search terms, or SoundCloud URL")
 async def play(inter: discord.Interaction, query: str):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
@@ -610,7 +684,7 @@ async def play(inter: discord.Interaction, query: str):
     asyncio.create_task(_handle_add(inter, query, False))
 
 @bot.tree.command(name="next", description="Add a song next in queue")
-@app_commands.describe(query="YouTube URL or search terms")
+@app_commands.describe(query="YouTube URL or search terms, or SoundCloud URL")
 async def play_next_cmd(inter: discord.Interaction, query: str):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
