@@ -1,8 +1,15 @@
-import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os
+import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os, traceback, tempfile
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
 from discord import app_commands
 from discord.ext import commands
+from mutagen import File as MutagenFile
+
+TOKEN = "bot token"
+LEAVE_SOUND = "leave.mp3"  # short, quiet chime bot exit chime (set to None to disable)
+CACHE_FILE = "cache.json" # Json file to store cache
+OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
+USE_CACHE = True # Disabling bypasses cache entirely
 
 def ytdlp_updated() -> bool:
     try:
@@ -27,12 +34,8 @@ try:
     from yt_dlp import YoutubeDL
 
 except Exception as e:
+    traceback.print_exc()
     print(f"Failed to check/update yt-dlp: {e}")
-
-TOKEN = "bot token"
-CACHE_FILE = "cache.json" # Json file to store cache
-OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
-USE_CACHE = True # Disabling bypasses cache entirely
 
 cache_entries: list[dict] = []
 key_map: dict[str, dict] = {}
@@ -52,7 +55,8 @@ def load_cache():
             for entry in cache_entries:
                 for k in entry.get("keys", []):
                     key_map[k] = entry
-        except Exception:
+        except Exception as e:
+            traceback.print_exc()
             cache_entries, key_map = [], {}
 
 def save_cache():
@@ -63,12 +67,13 @@ def save_cache():
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cache_entries, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CACHE_FILE)
-    except Exception:
+    except Exception as e:
+        traceback.print_exc()
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
-        except Exception:
-            pass
+        except Exception as e2:
+            traceback.print_exc()
 
 load_cache()
 
@@ -99,6 +104,7 @@ stream_ydl = YoutubeDL(ydl_opts)
 search_ydl = YoutubeDL({**ydl_opts, "extract_flat": True})
 url_re = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.IGNORECASE)
 soundcloud_re = re.compile(r"(https?://)?(www\.)?(m\.)?(soundcloud\.com|on\.soundcloud\.com)/", re.IGNORECASE)
+generic_http_re = re.compile(r"^https?://", re.IGNORECASE)
 
 intents = discord.Intents.all()
 intents.voice_states = True
@@ -166,34 +172,38 @@ async def ensure_voice(inter: discord.Interaction) -> bool:
     text_channel = inter.channel
     return True
 
-def clear_all():
+async def clear_all(play_leave_sound: bool = True):
     global music_queue, music_history, voice_client, now_playing_msg
-
     vc = voice_client
     msg = now_playing_msg
-
     music_queue.clear()
     music_history.clear()
     voice_client = None
     now_playing_msg = None
-
     if vc and vc.is_connected():
-        async def _disc(v: discord.VoiceClient):
-            try:
-                await v.disconnect()
-            except discord.HTTPException as e:
-                print(f"Failed to disconnect: {e}")
-
-        asyncio.create_task(_disc(vc))
-
+        try:
+            if play_leave_sound and LEAVE_SOUND and os.path.exists(LEAVE_SOUND):
+                try:
+                    if vc.is_playing() or vc.is_paused():
+                        vc.stop()
+                    done = asyncio.Event()
+                    def _after(_):
+                        bot.loop.call_soon_threadsafe(done.set)
+                    vc.play(discord.FFmpegPCMAudio(LEAVE_SOUND), after=_after)
+                    try:
+                        await asyncio.wait_for(done.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        pass
+                except Exception:
+                    traceback.print_exc()
+            await vc.disconnect()
+        except discord.HTTPException as e:
+            print(f"Failed to disconnect: {e}")
     if msg:
-        async def _delete_msg(m: discord.Message):
-            try:
-                await m.delete()
-            except discord.HTTPException as e:
-                print(f"Failed to delete now playing message: {e}")
-
-        asyncio.create_task(_delete_msg(msg))
+        try:
+            await msg.delete()
+        except discord.HTTPException as e:
+            print(f"Failed to delete now playing message: {e}")
 
 async def auto_disconnect():
     global voice_client, disconnect_task
@@ -208,12 +218,12 @@ async def auto_disconnect():
         non_bot_members = [m for m in channel.members if not m.bot]
 
     if not non_bot_members and voice_client.is_paused():
-        clear_all()
+        await clear_all()
         return
 
     if not voice_client.is_playing() and not voice_client.is_paused() and not music_queue:
-        clear_all()
-
+        await clear_all()
+        
 def _arm_idle_timer():
     global disconnect_task
     if disconnect_task:
@@ -240,13 +250,17 @@ async def _url_is_valid(u: str) -> bool:
         sess = get_session()
         async with sess.head(u, allow_redirects=True) as resp:
             return 200 <= resp.status < 400
-    except Exception:
+    except Exception as e:
+        traceback.print_exc()
         return False
 
 async def _refresh_entry_in_place(entry: dict) -> dict:
     raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(entry["webpage_url"], download=False))
     if "entries" in raw:
-        raw = raw["entries"][0]
+        entries = raw.get("entries") or []
+        if not entries:
+            raise RuntimeError("No entries returned while refreshing cache entry")
+        raw = entries[0]
     for k in ("url", "duration", "title", "uploader"):
         entry[k] = raw.get(k)
     save_cache()
@@ -265,7 +279,64 @@ async def _prefetch_next(n: int = 2):
                         i[k] = entry[k]
         tasks.append(asyncio.create_task(ensure_item()))
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                traceback.print_exception(type(r), r, r.__traceback__)
+
+async def _extract_direct_media_info(url: str) -> dict:
+    try:
+        sess = get_session()
+        async with sess.get(url) as resp:
+            resp.raise_for_status()
+            path = urlparse(url).path or ""
+            ext = os.path.splitext(path)[1]
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext if ext else None)
+            tmp_path = tmp.name
+            try:
+                async for chunk in resp.content.iter_chunked(1024 * 64):
+                    if not chunk:
+                        continue
+                    tmp.write(chunk)
+            finally:
+                tmp.close()
+
+        title = os.path.basename(path) or "Unknown title"
+        if "." in title:
+            title = ".".join(title.split(".")[:-1]) or title
+
+        uploader = "Remote File"
+        duration = 0
+
+        try:
+            audio = MutagenFile(tmp_path, easy=True)
+            if audio is not None:
+                if audio.tags:
+                    if "title" in audio.tags and audio.tags["title"]:
+                        title = str(audio.tags["title"][0])
+                    if "artist" in audio.tags and audio.tags["artist"]:
+                        uploader = str(audio.tags["artist"][0])
+                if hasattr(audio, "info") and getattr(audio.info, "length", None) is not None:
+                    duration = int(audio.info.length)
+        except Exception as e:
+            traceback.print_exc()
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception as e:
+                traceback.print_exc()
+
+        info = {
+            "url": url,
+            "webpage_url": url,
+            "title": title or "Unknown title",
+            "duration": duration or 0,
+            "uploader": uploader or "Remote File"
+        }
+        return info
+    except Exception as e:
+        traceback.print_exc()
+        raise
 
 async def _play_next():
     global now_playing_msg
@@ -284,32 +355,48 @@ async def _play_next():
     item = music_queue.pop(0)
     music_history.insert(0, item)
 
-    if not await _url_is_valid(item["url"]):
-        entry = key_map.get(item["webpage_url"])
-        if entry:
-            try:
-                await _refresh_entry_in_place(entry)
-                for k in ("url", "duration", "title", "uploader"):
-                    item[k] = entry[k]
-            except Exception:
-                try:
-                    flat = await asyncio.to_thread(
-                        lambda: search_ydl.extract_info(f"ytsearch1:{entry['title']}", download=False)
-                    )
-                    vid = flat["entries"][0]["id"]
-                    raw = await asyncio.to_thread(
-                        lambda: stream_ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-                    )
-                    for k in ("url", "duration", "title", "uploader"):
-                        entry[k] = raw.get(k)
-                        item[k] = raw.get(k)
-                    save_cache()
-                except Exception:
-                    pass
+    try:
+        if item["url"].startswith("http"):
+            if not await _url_is_valid(item["url"]):
+                entry = key_map.get(item["webpage_url"])
+                if entry:
+                    try:
+                        await _refresh_entry_in_place(entry)
+                        for k in ("url", "duration", "title", "uploader"):
+                            item[k] = entry[k]
+                    except Exception:
+                        traceback.print_exc()
+                        try:
+                            flat = await asyncio.to_thread(
+                                lambda: search_ydl.extract_info(f"ytsearch1:{entry['title']}", download=False)
+                            )
+                            entries = flat.get("entries") or []
+                            if not entries:
+                                raise RuntimeError("No entries returned while trying to recover track")
+                            vid = entries[0]["id"]
+                            raw = await asyncio.to_thread(
+                                lambda: stream_ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+                            )
+                            if "entries" in raw:
+                                raw_entries = raw.get("entries") or []
+                                if not raw_entries:
+                                    raise RuntimeError("No entries returned for recovered video")
+                                raw = raw_entries[0]
+                            for k in ("url", "duration", "title", "uploader"):
+                                entry[k] = raw.get(k)
+                                item[k] = raw.get(k)
+                            save_cache()
+                        except Exception:
+                            traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
 
     def _after_playback(_):
-        fut = asyncio.run_coroutine_threadsafe(_play_next(), bot.loop)
-        fut.result()
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_play_next(), bot.loop)
+            fut.result()
+        except Exception as e:
+            traceback.print_exc()
 
     voice_client.play(
         discord.FFmpegPCMAudio(
@@ -382,6 +469,7 @@ class NowPlayingView(View):
                 ephemeral=False
             )
         except Exception as e:
+            traceback.print_exc()
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏮️ Back", style=discord.ButtonStyle.primary, custom_id="previous")
@@ -408,6 +496,7 @@ class NowPlayingView(View):
                     allowed_mentions=discord.AllowedMentions.none()
                 )
         except Exception as e:
+            traceback.print_exc()
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏸ Pause", style=discord.ButtonStyle.primary, custom_id="pauseplay")
@@ -451,12 +540,14 @@ class NowPlayingView(View):
                 ephemeral=False
             )
         except Exception as e:
+            traceback.print_exc()
             if not inter.response.is_done():
                 await inter.response.send_message(f"🚫 {e}", ephemeral=True)
             else:
                 await inter.followup.send(f"🚫 {e}", ephemeral=True)
 
         except Exception as e:
+            traceback.print_exc()
             if not inter.response.is_done():
                 await inter.response.send_message(f"🚫 {e}", ephemeral=True)
             else:
@@ -497,12 +588,13 @@ class NowPlayingView(View):
                     ephemeral=False
                 )
         except Exception as e:
+            traceback.print_exc()
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
 
     @button(label="⏹ Stop", style=discord.ButtonStyle.danger, custom_id="stop")
     async def stop(self, inter: discord.Interaction, _btn: Button):
         try:
-            clear_all()
+            await clear_all()
             await inter.response.send_message(
                 embed=discord.Embed(
                     description=f"{inter.user.mention} stopped playback and cleared the queue",
@@ -512,7 +604,9 @@ class NowPlayingView(View):
                 ephemeral=False
             )
         except Exception as e:
+            traceback.print_exc()
             await inter.response.send_message(f"🚫 {e}", ephemeral=True)
+
 
 class QueueView(View):
     def __init__(self, page: int = 0):
@@ -551,7 +645,10 @@ async def _extract_soundcloud_info(url: str) -> dict:
 
     raw = await asyncio.to_thread(_run)
     if "entries" in raw:
-        raw = raw["entries"][0]
+        entries = raw.get("entries") or []
+        if not entries:
+            raise RuntimeError("No entries returned for this SoundCloud URL")
+        raw = entries[0]
 
     fmts = raw.get("formats") or []
     fmt_url = raw.get("url")
@@ -585,24 +682,64 @@ async def _extract_soundcloud_info(url: str) -> dict:
 
     return info
 
-
 async def _handle_add(inter: discord.Interaction, query: str, front: bool):
     try:
         raw_query = query.strip()
+        if raw_query.lower().startswith("query:"):
+            raw_query = raw_query[6:].strip()
+
         is_sc = bool(soundcloud_re.match(raw_query))
+        is_yt = bool(url_re.match(raw_query))
+        is_http = bool(generic_http_re.match(raw_query))
 
         if is_sc:
             info = await _extract_soundcloud_info(raw_query)
             entry = info
-        else:
-            key = raw_query if url_re.match(raw_query) else raw_query.lower()
+        elif is_yt:
+            key = raw_query
             if USE_CACHE and key in key_map:
                 entry = key_map[key]
             else:
-                search_str = raw_query if url_re.match(raw_query) else f"ytsearch1:{query}"
+                search_str = raw_query
                 raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(search_str, download=False))
                 if "entries" in raw:
-                    raw = raw["entries"][0]
+                    entries = raw.get("entries") or []
+                    if not entries:
+                        raise RuntimeError("No entries returned for this URL")
+                    raw = entries[0]
+                info = {k: raw.get(k) for k in ("url", "webpage_url", "title", "duration", "uploader")}
+                entry = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
+                if entry:
+                    entry.update(info)
+                else:
+                    entry = {"keys": [], **info}
+                    cache_entries.append(entry)
+                if USE_CACHE:
+                    if key not in entry["keys"]:
+                        entry["keys"].append(key)
+                    canon = canonical_url(info["webpage_url"])
+                    if canon and canon not in entry["keys"]:
+                        entry["keys"].append(canon)
+                    key_map.clear()
+                    for e in cache_entries:
+                        for k2 in e["keys"]:
+                            key_map[k2] = e
+                    save_cache()
+        elif is_http:
+            info = await _extract_direct_media_info(raw_query)
+            entry = info
+        else:
+            key = raw_query.lower()
+            if USE_CACHE and key in key_map:
+                entry = key_map[key]
+            else:
+                search_str = f"ytsearch1:{raw_query}"
+                raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(search_str, download=False))
+                if "entries" in raw:
+                    entries = raw.get("entries") or []
+                    if not entries:
+                        raise RuntimeError("No entries returned for this search")
+                    raw = entries[0]
                 info = {k: raw.get(k) for k in ("url", "webpage_url", "title", "duration", "uploader")}
                 entry = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
                 if entry:
@@ -652,6 +789,74 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
             ephemeral=False
         )
     except Exception as e:
+        traceback.print_exc()
+        await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
+
+async def _handle_file_add(inter: discord.Interaction, attachment: discord.Attachment, front: bool):
+    try:
+        if attachment is None:
+            await inter.followup.send("🚫 No file provided.", ephemeral=True)
+            return
+
+        suffix = os.path.splitext(attachment.filename or "")[1]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix if suffix else None)
+        tmp_path = tmp.name
+        tmp.close()
+        await attachment.save(tmp_path)
+
+        title = attachment.filename or "Unknown title"
+        uploader = "Local File"
+        duration = 0
+
+        try:
+            audio = MutagenFile(tmp_path, easy=True)
+            if audio is not None:
+                if audio.tags:
+                    if "title" in audio.tags and audio.tags["title"]:
+                        title = str(audio.tags["title"][0])
+                    if "artist" in audio.tags and audio.tags["artist"]:
+                        uploader = str(audio.tags["artist"][0])
+                if hasattr(audio, "info") and getattr(audio.info, "length", None) is not None:
+                    duration = int(audio.info.length)
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            traceback.print_exc()
+
+        item = {
+            "url": attachment.url,
+            "webpage_url": attachment.url,
+            "title": title,
+            "duration": duration,
+            "uploader": uploader,
+            "requester": inter.user
+        }
+
+        if front:
+            music_queue.insert(0, item)
+            pos = 1
+        else:
+            music_queue.append(item)
+            pos = len(music_queue)
+
+        if pos == 1 and voice_client and not voice_client.is_playing() and not voice_client.is_paused():
+            await _play_next()
+        else:
+            asyncio.create_task(_prefetch_next(2))
+
+        await inter.followup.send(
+            embed=discord.Embed(
+                title=f"Added to Queue #{pos}",
+                description=f"[{item['title']}]({item['webpage_url']}) " f"`{format_duration(item['duration'])}`",
+                color=discord.Color.blue()
+            ),
+            ephemeral=False
+        )
+    except Exception as e:
+        traceback.print_exc()
         await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
 
 @bot.tree.command(name="nowplaying", description="Refresh the Now Playing message")
@@ -700,15 +905,23 @@ async def join(inter: discord.Interaction):
         await inter.followup.send("✅ Joined your voice channel.", ephemeral=False)
 
 @bot.tree.command(name="play", description="Add a song to the queue")
-@app_commands.describe(query="YouTube URL or search terms, or SoundCloud URL")
+@app_commands.describe(query="YouTube URL or search terms, or SoundCloud/other URL")
 async def play(inter: discord.Interaction, query: str):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
         return
     asyncio.create_task(_handle_add(inter, query, False))
 
+@bot.tree.command(name="playfile", description="Add an audio/video file to the queue")
+@app_commands.describe(file="Audio or video file attachment")
+async def playfile(inter: discord.Interaction, file: discord.Attachment):
+    await inter.response.defer(thinking=True, ephemeral=False)
+    if not await ensure_voice(inter):
+        return
+    asyncio.create_task(_handle_file_add(inter, file, False))
+
 @bot.tree.command(name="next", description="Add a song next in queue")
-@app_commands.describe(query="YouTube URL or search terms, or SoundCloud URL")
+@app_commands.describe(query="YouTube URL or search terms, or SoundCloud/other URL")
 async def play_next_cmd(inter: discord.Interaction, query: str):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
@@ -819,7 +1032,7 @@ async def stop_cmd(inter: discord.Interaction):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not voice_client or not voice_client.is_connected():
         return await inter.followup.send("🚫 I'm not in a voice channel.", ephemeral=True)
-    clear_all()
+    await clear_all()
     await inter.followup.send("🛑 Stopped and cleared queue.", ephemeral=False)
 
 async def check_permission(inter: discord.Interaction, OWNER_ONLY: bool):
@@ -856,7 +1069,10 @@ async def addkey(inter: discord.Interaction, query: str, video_url: str):
         return await inter.followup.send("🚫 Invalid YouTube URL.", ephemeral=True)
     raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(canon, download=False))
     if "entries" in raw:
-        raw = raw["entries"][0]
+        entries = raw.get("entries") or []
+        if not entries:
+            return await inter.followup.send("🚫 No entries returned for this URL.", ephemeral=True)
+        raw = entries[0]
     info = {k: raw.get(k) for k in ("url", "webpage_url", "title", "duration", "uploader")}
     entry = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
     if entry:
@@ -906,6 +1122,7 @@ async def importcache(inter: discord.Interaction, file: discord.Attachment):
         raw = await file.read()
         data = json.loads(raw.decode("utf-8", errors="ignore"))
     except Exception as e:
+        traceback.print_exc()
         return await inter.followup.send(f"🚫 Failed to read JSON: {e}", ephemeral=True)
 
     if not isinstance(data, list):
