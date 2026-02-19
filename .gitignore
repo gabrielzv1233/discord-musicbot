@@ -3,3 +3,4 @@ ttsos mb.py
 cache.json
 http_cache/
 cookies.txt
+_leave.*

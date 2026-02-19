@@ -6,7 +6,7 @@ from discord.ext import commands
 from mutagen import File as MutagenFile
 
 TOKEN = "bot token"
-LEAVE_SOUND = "leave.mp3"  # short, quiet chime bot exit chime (set to None to disable)
+LEAVE_SOUND = "_leave.mp3"  # short, quiet chime bot exit chime (set to None to disable)
 CACHE_FILE = "cache.json" # Json file to store cache
 OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
 USE_CACHE = True # Disabling bypasses cache entirely
@@ -692,9 +692,12 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
         is_yt = bool(url_re.match(raw_query))
         is_http = bool(generic_http_re.match(raw_query))
 
+        entry = None
+
         if is_sc:
             info = await _extract_soundcloud_info(raw_query)
             entry = info
+
         elif is_yt:
             key = raw_query
             if USE_CACHE and key in key_map:
@@ -725,9 +728,117 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
                         for k2 in e["keys"]:
                             key_map[k2] = e
                     save_cache()
+
         elif is_http:
-            info = await _extract_direct_media_info(raw_query)
-            entry = info
+            content_type = None
+            sess = get_session()
+            try:
+                async with sess.head(raw_query, allow_redirects=True) as resp:
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    if ct.startswith("audio/") or ct.startswith("video/"):
+                        content_type = ct.split(";", 1)[0]
+            except Exception:
+                traceback.print_exc()
+
+            if content_type:
+                try:
+                    async with sess.get(raw_query) as resp:
+                        resp.raise_for_status()
+                        path = urlparse(raw_query).path or ""
+                        ext = os.path.splitext(path)[1]
+
+                        if not ext:
+                            ct_map = {
+                                "audio/mpeg": ".mp3",
+                                "audio/mp3": ".mp3",
+                                "audio/ogg": ".ogg",
+                                "audio/opus": ".opus",
+                                "audio/wav": ".wav",
+                                "audio/x-wav": ".wav",
+                                "audio/flac": ".flac",
+                                "video/mp4": ".mp4",
+                                "video/webm": ".webm",
+                                "video/x-matroska": ".mkv",
+                            }
+                            ext = ct_map.get(content_type, "")
+
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext if ext else None)
+                        tmp_path = tmp.name
+                        try:
+                            async for chunk in resp.content.iter_chunked(1024 * 64):
+                                if chunk:
+                                    tmp.write(chunk)
+                        finally:
+                            tmp.close()
+
+                    title = os.path.basename(path) or "Unknown title"
+                    if "." in title:
+                        title = ".".join(title.split(".")[:-1]) or title
+
+                    uploader = "Remote File"
+                    duration = 0
+
+                    try:
+                        audio = MutagenFile(tmp_path, easy=True)
+                        if audio is not None:
+                            if audio.tags:
+                                if "title" in audio.tags and audio.tags["title"]:
+                                    title = str(audio.tags["title"][0])
+                                if "artist" in audio.tags and audio.tags["artist"]:
+                                    uploader = str(audio.tags["artist"][0])
+                            if hasattr(audio, "info") and getattr(audio.info, "length", None) is not None:
+                                duration = int(audio.info.length)
+                    except Exception:
+                        traceback.print_exc()
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            traceback.print_exc()
+
+                    entry = {
+                        "url": raw_query,
+                        "webpage_url": raw_query,
+                        "title": title,
+                        "duration": duration,
+                        "uploader": uploader
+                    }
+
+                except Exception:
+                    traceback.print_exc()
+                    err_embed = discord.Embed(
+                        title="Invalid Media",
+                        description="URL downloaded but was not a valid audio/video file.",
+                        color=discord.Color.red()
+                    )
+                    await inter.followup.send(embed=err_embed, ephemeral=True)
+                    return
+
+            else:
+                try:
+                    raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(raw_query, download=False))
+                    if "entries" in raw:
+                        entries = raw.get("entries") or []
+                        if not entries:
+                            raise RuntimeError("No entries returned for this URL")
+                        raw = entries[0]
+                    entry = {
+                        "url": raw.get("url"),
+                        "webpage_url": raw.get("webpage_url"),
+                        "title": raw.get("title"),
+                        "duration": raw.get("duration"),
+                        "uploader": raw.get("uploader"),
+                    }
+                except Exception:
+                    traceback.print_exc()
+                    err_embed = discord.Embed(
+                        title="No Results",
+                        description="Could not find any playable track from this URL.",
+                        color=discord.Color.red()
+                    )
+                    await inter.followup.send(embed=err_embed, ephemeral=True)
+                    return
+
         else:
             key = raw_query.lower()
             if USE_CACHE and key in key_map:
@@ -759,6 +870,15 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
                             key_map[k2] = e
                     save_cache()
 
+        if not entry or not entry.get("url"):
+            err_embed = discord.Embed(
+                title="No Results",
+                description="Could not find a playable track from that query or URL.",
+                color=discord.Color.red()
+            )
+            await inter.followup.send(embed=err_embed, ephemeral=True)
+            return
+
         item = {
             "url": entry["url"],
             "webpage_url": entry["webpage_url"],
@@ -783,7 +903,7 @@ async def _handle_add(inter: discord.Interaction, query: str, front: bool):
         await inter.followup.send(
             embed=discord.Embed(
                 title=f"Added to Queue #{pos}",
-                description=f"[{item['title']}]({item['webpage_url']}) " f"`{format_duration(item['duration'])}`",
+                description=f"[{item['title']}]({item['webpage_url']}) `{format_duration(item['duration'])}`",
                 color=discord.Color.blue()
             ),
             ephemeral=False
