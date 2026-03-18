@@ -4,3 +4,5 @@ cache.json
 http_cache/
 cookies.txt
 _leave.*
+.vscode/
+__pycache__/

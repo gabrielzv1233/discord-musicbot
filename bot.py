@@ -1,4 +1,5 @@
 import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os, traceback, tempfile
+from contextlib import suppress
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
 from discord import app_commands
@@ -10,6 +11,13 @@ LEAVE_SOUND = "_leave.mp3"  # short, quiet chime bot exit chime (set to None to 
 CACHE_FILE = "cache.json" # Json file to store cache
 OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
 USE_CACHE = True # Disabling bypasses cache entirely
+LOW_BANDWIDTH_MODE = True # Restart the bot after changing. Reduces source bitrate and Discord voice bitrate.
+
+NORMAL_SOURCE_ABR_LIMIT = 64
+LOW_BANDWIDTH_SOURCE_ABR_LIMIT = 64
+LOW_BANDWIDTH_MIN_SOURCE_ABR = 48
+LOW_BANDWIDTH_DISCORD_BITRATE = 96
+LOW_BANDWIDTH_DISCORD_BANDWIDTH = "full"
 
 def ytdlp_updated() -> bool:
     try:
@@ -78,30 +86,66 @@ def save_cache():
 load_cache()
 
 cookiefile = "cookies.txt"
-ydl_opts = {
-    "format": "bestaudio[abr<=64]/bestaudio/best",
-    "quiet": True,
-    "noplaylist": True,
-    "forcejson": True,
-    "nocheckcertificate": True,
-    "default_search": "auto",
-    "source_address": "0.0.0.0",
-    "geo_bypass": True,
-    "geo_bypass_country": "US",
-    "extractor_args": {"youtube": {
-        "player_client": ["android", "web"],
-        "skip": ["dash"]
-    }},
-    "player_skip": ["webpage"],
-    "noprogress": True,
-    "concurrent_fragment_downloads": 1,
-    "skip_download": True
-}
-if os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0:
-    ydl_opts["cookiefile"] = cookiefile
+def _stream_source_abr_limit() -> int:
+    return LOW_BANDWIDTH_SOURCE_ABR_LIMIT if LOW_BANDWIDTH_MODE else NORMAL_SOURCE_ABR_LIMIT
+
+def _build_stream_format() -> str:
+    abr_limit = _stream_source_abr_limit()
+    return f"bestaudio[abr<={abr_limit}]/bestaudio/best"
+
+def _build_ydl_opts(*, extract_flat: bool = False) -> dict:
+    opts = {
+        "format": _build_stream_format(),
+        "quiet": True,
+        "noplaylist": True,
+        "forcejson": True,
+        "nocheckcertificate": True,
+        "default_search": "auto",
+        "source_address": "0.0.0.0",
+        "geo_bypass": True,
+        "geo_bypass_country": "US",
+        "extractor_args": {"youtube": {
+            "player_client": ["android", "web"],
+            "skip": ["dash"]
+        }},
+        "player_skip": ["webpage"],
+        "noprogress": True,
+        "concurrent_fragment_downloads": 1,
+        "skip_download": True
+    }
+    if extract_flat:
+        opts["extract_flat"] = True
+    if os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0:
+        opts["cookiefile"] = cookiefile
+    return opts
+
+def _format_bitrate_value(fmt: dict) -> float:
+    return float(fmt.get("abr") or fmt.get("tbr") or 0)
+
+def _pick_soundcloud_format(candidates: list[dict]) -> dict:
+    if not LOW_BANDWIDTH_MODE:
+        return max(candidates, key=_format_bitrate_value)
+
+    positive = [fmt for fmt in candidates if _format_bitrate_value(fmt) > 0]
+    if not positive:
+        return candidates[0]
+
+    acceptable = [fmt for fmt in positive if _format_bitrate_value(fmt) >= LOW_BANDWIDTH_MIN_SOURCE_ABR]
+    pool = acceptable or positive
+    return min(pool, key=_format_bitrate_value)
+
+def _voice_playback_kwargs() -> dict:
+    if not LOW_BANDWIDTH_MODE:
+        return {}
+    return {
+        "bitrate": LOW_BANDWIDTH_DISCORD_BITRATE,
+        "bandwidth": LOW_BANDWIDTH_DISCORD_BANDWIDTH,
+    }
+
+ydl_opts = _build_ydl_opts()
 
 stream_ydl = YoutubeDL(ydl_opts)
-search_ydl = YoutubeDL({**ydl_opts, "extract_flat": True})
+search_ydl = YoutubeDL(_build_ydl_opts(extract_flat=True))
 url_re = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.IGNORECASE)
 soundcloud_re = re.compile(r"(https?://)?(www\.)?(m\.)?(soundcloud\.com|on\.soundcloud\.com)/", re.IGNORECASE)
 generic_http_re = re.compile(r"^https?://", re.IGNORECASE)
@@ -116,6 +160,7 @@ voice_client: discord.VoiceClient | None = None
 text_channel: discord.TextChannel | None = None
 now_playing_msg: discord.Message | None = None
 disconnect_task: asyncio.Task | None = None
+shutting_down = False
 
 _http_session: aiohttp.ClientSession | None = None
 
@@ -130,6 +175,18 @@ async def close_session():
     if _http_session and not _http_session.closed:
         await _http_session.close()
         _http_session = None
+
+async def _cancel_disconnect_task():
+    global disconnect_task
+    task = disconnect_task
+    disconnect_task = None
+    if task is None:
+        return
+    if task is asyncio.current_task():
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 def format_duration(sec: int) -> str:
     sec = int(sec)
@@ -172,20 +229,26 @@ async def ensure_voice(inter: discord.Interaction) -> bool:
     text_channel = inter.channel
     return True
 
-async def clear_all(play_leave_sound: bool = True):
-    global music_queue, music_history, voice_client, now_playing_msg
+async def clear_all(play_leave_sound: bool = True, force_disconnect: bool = False, cleanup_message: bool = True):
+    global music_queue, music_history, voice_client, now_playing_msg, text_channel
     vc = voice_client
     msg = now_playing_msg
+    await _cancel_disconnect_task()
     music_queue.clear()
     music_history.clear()
     voice_client = None
     now_playing_msg = None
+    text_channel = None
     if vc and vc.is_connected():
         try:
+            try:
+                if vc.is_playing() or vc.is_paused():
+                    vc.stop()
+            except Exception:
+                traceback.print_exc()
+
             if play_leave_sound and LEAVE_SOUND and os.path.exists(LEAVE_SOUND):
                 try:
-                    if vc.is_playing() or vc.is_paused():
-                        vc.stop()
                     done = asyncio.Event()
                     def _after(_):
                         bot.loop.call_soon_threadsafe(done.set)
@@ -196,14 +259,16 @@ async def clear_all(play_leave_sound: bool = True):
                         pass
                 except Exception:
                     traceback.print_exc()
-            await vc.disconnect()
-        except discord.HTTPException as e:
-            print(f"Failed to disconnect: {e}")
-    if msg:
+            await vc.disconnect(force=force_disconnect)
+        except (discord.HTTPException, discord.ClientException) as e:
+            if not shutting_down:
+                print(f"Failed to disconnect: {e}")
+    if msg and cleanup_message:
         try:
             await msg.delete()
         except discord.HTTPException as e:
-            print(f"Failed to delete now playing message: {e}")
+            if not shutting_down:
+                print(f"Failed to delete now playing message: {e}")
 
 async def auto_disconnect():
     global voice_client, disconnect_task
@@ -223,6 +288,20 @@ async def auto_disconnect():
 
     if not voice_client.is_playing() and not voice_client.is_paused() and not music_queue:
         await clear_all()
+
+async def shutdown_cleanup():
+    global shutting_down
+    if shutting_down:
+        await close_session()
+        return
+
+    shutting_down = True
+    try:
+        await clear_all(play_leave_sound=False, force_disconnect=True, cleanup_message=False)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        await close_session()
         
 def _arm_idle_timer():
     global disconnect_task
@@ -266,6 +345,131 @@ async def _refresh_entry_in_place(entry: dict) -> dict:
     save_cache()
     return entry
 
+class TrackResolveError(RuntimeError):
+    pass
+
+class PlaylistFormatError(RuntimeError):
+    pass
+
+def _rebuild_key_map():
+    key_map.clear()
+    for entry in cache_entries:
+        for key in entry.get("keys", []):
+            key_map[key] = entry
+
+def _store_cache_entry(info: dict, *keys: str) -> dict:
+    entry = next((e for e in cache_entries if e["webpage_url"] == info["webpage_url"]), None)
+    if entry:
+        entry.update(info)
+    else:
+        entry = {"keys": [], **info}
+        cache_entries.append(entry)
+
+    if USE_CACHE:
+        canon = canonical_url(info.get("webpage_url") or "")
+        for key in (*keys, canon):
+            if key and key not in entry["keys"]:
+                entry["keys"].append(key)
+        _rebuild_key_map()
+        save_cache()
+
+    return entry
+
+def _content_type_to_suffix(content_type: str | None) -> str:
+    ct_map = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/opus": ".opus",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/flac": ".flac",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+    }
+    return ct_map.get((content_type or "").lower(), "")
+
+def _extract_media_tags(path: str, fallback_title: str, fallback_uploader: str) -> tuple[str, str, int]:
+    title = fallback_title or "Unknown title"
+    uploader = fallback_uploader or "Unknown"
+    duration = 0
+
+    try:
+        audio = MutagenFile(path, easy=True)
+        if audio is not None:
+            if audio.tags:
+                if "title" in audio.tags and audio.tags["title"]:
+                    title = str(audio.tags["title"][0])
+                if "artist" in audio.tags and audio.tags["artist"]:
+                    uploader = str(audio.tags["artist"][0])
+            if hasattr(audio, "info") and getattr(audio.info, "length", None) is not None:
+                duration = int(audio.info.length)
+    except Exception:
+        traceback.print_exc()
+
+    return title, uploader, duration
+
+def _make_queue_item(entry: dict, requester: discord.abc.User) -> dict:
+    return {
+        "url": entry["url"],
+        "webpage_url": entry["webpage_url"],
+        "title": entry["title"],
+        "duration": entry["duration"],
+        "uploader": entry["uploader"],
+        "requester": requester,
+    }
+
+def _enqueue_item(item: dict, front: bool) -> int:
+    if front:
+        music_queue.insert(0, item)
+        return 1
+
+    music_queue.append(item)
+    return len(music_queue)
+
+def _normalize_query(query: str) -> str:
+    raw_query = query.strip()
+    if raw_query.lower().startswith("query:"):
+        raw_query = raw_query[6:].strip()
+    return raw_query
+
+def _is_generic_title(title: str | None, source_url: str | None = None) -> bool:
+    cleaned = (title or "").strip()
+    if not cleaned:
+        return True
+
+    lowered = cleaned.lower()
+    if lowered in {"unknown title", "unknown"}:
+        return True
+
+    path = urlparse(source_url or "").path or ""
+    basename = os.path.basename(path)
+    stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    if stem and lowered == stem.lower():
+        return True
+
+    if re.fullmatch(r"[a-f0-9]{24,}", cleaned, re.IGNORECASE):
+        return True
+
+    return False
+
+def _apply_playlist_metadata(entry: dict, metadata: dict | None) -> dict:
+    if not metadata:
+        return entry
+
+    merged = dict(entry)
+    title = (metadata.get("title") or "").strip()
+    duration = metadata.get("duration")
+
+    if title and _is_generic_title(merged.get("title"), merged.get("webpage_url")):
+        merged["title"] = title
+
+    if duration and not merged.get("duration"):
+        merged["duration"] = int(duration)
+
+    return merged
+
 async def _prefetch_next(n: int = 2):
     tasks = []
     for item in music_queue[:max(0, n)]:
@@ -284,20 +488,23 @@ async def _prefetch_next(n: int = 2):
             if isinstance(r, Exception):
                 traceback.print_exception(type(r), r, r.__traceback__)
 
-async def _extract_direct_media_info(url: str) -> dict:
+async def _extract_direct_media_info(url: str, content_type: str | None = None) -> dict:
+    tmp_path = None
     try:
         sess = get_session()
         async with sess.get(url) as resp:
             resp.raise_for_status()
             path = urlparse(url).path or ""
             ext = os.path.splitext(path)[1]
+            resp_ct = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            ext = ext or _content_type_to_suffix(content_type or resp_ct)
+
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext if ext else None)
             tmp_path = tmp.name
             try:
                 async for chunk in resp.content.iter_chunked(1024 * 64):
-                    if not chunk:
-                        continue
-                    tmp.write(chunk)
+                    if chunk:
+                        tmp.write(chunk)
             finally:
                 tmp.close()
 
@@ -305,41 +512,123 @@ async def _extract_direct_media_info(url: str) -> dict:
         if "." in title:
             title = ".".join(title.split(".")[:-1]) or title
 
-        uploader = "Remote File"
-        duration = 0
-
-        try:
-            audio = MutagenFile(tmp_path, easy=True)
-            if audio is not None:
-                if audio.tags:
-                    if "title" in audio.tags and audio.tags["title"]:
-                        title = str(audio.tags["title"][0])
-                    if "artist" in audio.tags and audio.tags["artist"]:
-                        uploader = str(audio.tags["artist"][0])
-                if hasattr(audio, "info") and getattr(audio.info, "length", None) is not None:
-                    duration = int(audio.info.length)
-        except Exception as e:
-            traceback.print_exc()
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception as e:
-                traceback.print_exc()
-
-        info = {
+        title, uploader, duration = _extract_media_tags(tmp_path, title, "Remote File")
+        return {
             "url": url,
             "webpage_url": url,
             "title": title or "Unknown title",
             "duration": duration or 0,
-            "uploader": uploader or "Remote File"
+            "uploader": uploader or "Remote File",
         }
-        return info
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         raise
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                traceback.print_exc()
+
+async def _extract_cached_or_raw_entry(search_str: str, *cache_keys: str) -> dict:
+    for key in cache_keys:
+        if USE_CACHE and key in key_map:
+            return key_map[key]
+
+    raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(search_str, download=False))
+    if "entries" in raw:
+        entries = raw.get("entries") or []
+        if not entries:
+            raise RuntimeError("No entries returned while resolving track")
+        raw = entries[0]
+
+    info = {k: raw.get(k) for k in ("url", "webpage_url", "title", "duration", "uploader")}
+    if not info.get("url"):
+        raise RuntimeError("No playable URL returned while resolving track")
+
+    return _store_cache_entry(info, *cache_keys)
+
+async def _resolve_http_entry(raw_query: str) -> dict:
+    content_type = None
+    sess = get_session()
+
+    try:
+        async with sess.head(raw_query, allow_redirects=True) as resp:
+            ct = resp.headers.get("Content-Type", "").lower()
+            if ct.startswith("audio/") or ct.startswith("video/"):
+                content_type = ct.split(";", 1)[0]
+    except Exception:
+        traceback.print_exc()
+
+    if content_type:
+        try:
+            return await _extract_direct_media_info(raw_query, content_type)
+        except Exception as exc:
+            raise TrackResolveError("Invalid media file or unsupported codec.") from exc
+
+    try:
+        raw = await asyncio.to_thread(lambda: stream_ydl.extract_info(raw_query, download=False))
+        if "entries" in raw:
+            entries = raw.get("entries") or []
+            if not entries:
+                raise RuntimeError("No entries returned for this URL")
+            raw = entries[0]
+        entry = {
+            "url": raw.get("url"),
+            "webpage_url": raw.get("webpage_url"),
+            "title": raw.get("title"),
+            "duration": raw.get("duration"),
+            "uploader": raw.get("uploader"),
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        raise TrackResolveError("Could not find any playable track from this URL.") from exc
+
+    if not entry.get("url"):
+        raise TrackResolveError("Could not find any playable track from this URL.")
+
+    return entry
+
+async def _resolve_track_entry(query: str) -> dict:
+    raw_query = _normalize_query(query)
+    if not raw_query:
+        raise TrackResolveError("Query is empty.")
+
+    try:
+        if soundcloud_re.match(raw_query):
+            entry = await _extract_soundcloud_info(raw_query)
+        elif url_re.match(raw_query):
+            entry = await _extract_cached_or_raw_entry(raw_query, raw_query, canonical_url(raw_query))
+        elif generic_http_re.match(raw_query):
+            entry = await _resolve_http_entry(raw_query)
+        else:
+            entry = await _extract_cached_or_raw_entry(f"ytsearch1:{raw_query}", raw_query.lower())
+    except TrackResolveError:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise TrackResolveError("Could not find a playable track from that query or URL.") from exc
+
+    if not entry or not entry.get("url"):
+        raise TrackResolveError("Could not find a playable track from that query or URL.")
+
+    return {
+        "url": entry["url"],
+        "webpage_url": entry.get("webpage_url") or raw_query,
+        "title": entry.get("title") or "Unknown title",
+        "duration": entry.get("duration") or 0,
+        "uploader": entry.get("uploader") or "Unknown",
+    }
 
 async def _play_next():
     global now_playing_msg
+    if shutting_down:
+        return
+
+    vc = voice_client
+    if vc is None or not vc.is_connected():
+        return
+
     if not music_queue:
         if text_channel:
             await text_channel.send(
@@ -392,19 +681,31 @@ async def _play_next():
         traceback.print_exc()
 
     def _after_playback(_):
+        if shutting_down:
+            return
         try:
             fut = asyncio.run_coroutine_threadsafe(_play_next(), bot.loop)
             fut.result()
-        except Exception as e:
-            traceback.print_exc()
+        except Exception:
+            if not shutting_down:
+                traceback.print_exc()
 
-    voice_client.play(
-        discord.FFmpegPCMAudio(
-            item["url"],
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        ),
-        after=_after_playback,
-    )
+    play_kwargs = {"after": _after_playback, **_voice_playback_kwargs()}
+    try:
+        vc.play(
+            discord.FFmpegPCMAudio(
+                item["url"],
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            ),
+            **play_kwargs,
+        )
+    except discord.ClientException:
+        if music_history and music_history[0] is item:
+            music_history.pop(0)
+        music_queue.insert(0, item)
+        if not shutting_down:
+            traceback.print_exc()
+        return
 
     asyncio.create_task(_prefetch_next(2))
 
@@ -631,16 +932,10 @@ class QueueView(View):
 
 async def _extract_soundcloud_info(url: str) -> dict:
     def _run():
-        with YoutubeDL({
-            "format": "bestaudio/best",
-            "quiet": True,
-            "noplaylist": True,
-            "forcejson": True,
-            "nocheckcertificate": True,
-            "geo_bypass": True,
-            "geo_bypass_country": "US",
-            "skip_download": True
-        }) as ydl:
+        soundcloud_opts = _build_ydl_opts()
+        soundcloud_opts["geo_bypass"] = True
+        soundcloud_opts["geo_bypass_country"] = "US"
+        with YoutubeDL(soundcloud_opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     raw = await asyncio.to_thread(_run)
@@ -658,10 +953,7 @@ async def _extract_soundcloud_info(url: str) -> dict:
         candidates = [f for f in fmts if f.get("acodec") not in (None, "none")]
         if not candidates:
             candidates = fmts
-        best = max(
-            candidates,
-            key=lambda f: (f.get("abr") or f.get("tbr") or 0)
-        )
+        best = _pick_soundcloud_format(candidates)
         fmt_url = best.get("url") or fmt_url
         if not chosen_headers:
             chosen_headers = best.get("http_headers") or chosen_headers
@@ -682,7 +974,7 @@ async def _extract_soundcloud_info(url: str) -> dict:
 
     return info
 
-async def _handle_add(inter: discord.Interaction, query: str, front: bool):
+async def _handle_add_legacy(inter: discord.Interaction, query: str, front: bool):
     try:
         raw_query = query.strip()
         if raw_query.lower().startswith("query:"):
@@ -979,6 +1271,225 @@ async def _handle_file_add(inter: discord.Interaction, attachment: discord.Attac
         traceback.print_exc()
         await inter.followup.send(f"🚫 Error: {e}", ephemeral=True)
 
+def _make_track_error_embed(exc: TrackResolveError) -> discord.Embed:
+    lowered = str(exc).lower()
+    title = "Invalid Media" if "invalid media" in lowered or "codec" in lowered else "No Results"
+    return discord.Embed(title=title, description=str(exc), color=discord.Color.red())
+
+def _parse_extinf(line: str) -> dict | None:
+    try:
+        payload = line.split(":", 1)[1].strip()
+    except IndexError:
+        return None
+
+    if "," in payload:
+        duration_raw, title_raw = payload.split(",", 1)
+    else:
+        duration_raw, title_raw = payload, ""
+
+    duration = None
+    try:
+        parsed = int(float(duration_raw.strip()))
+        if parsed > 0:
+            duration = parsed
+    except Exception:
+        duration = None
+
+    title = title_raw.strip() or None
+    if not title and duration is None:
+        return None
+
+    return {"title": title, "duration": duration}
+
+def _parse_playlist_entries(text: str, filename: str) -> tuple[list[dict], list[dict]]:
+    suffix = os.path.splitext(filename or "")[1].lower()
+    if suffix not in {".txt", ".m3u8"}:
+        raise PlaylistFormatError("Unsupported playlist format. Upload a .txt or .m3u8 file.")
+
+    entries: list[dict] = []
+    errors: list[dict] = []
+    pending_metadata = None
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if suffix == ".m3u8":
+            if line.upper().startswith("#EXTINF:"):
+                pending_metadata = _parse_extinf(line)
+                continue
+            if line.startswith("#"):
+                continue
+
+        if not generic_http_re.match(line):
+            errors.append({
+                "line": line_number,
+                "error": "Invalid URL. Playlist files only accept absolute URLs."
+            })
+            if suffix == ".m3u8":
+                pending_metadata = None
+            continue
+
+        entries.append({
+            "line": line_number,
+            "url": line,
+            "metadata": pending_metadata if suffix == ".m3u8" else None,
+        })
+        pending_metadata = None
+
+    return entries, errors
+
+def _format_playlist_error_chunks(filename: str, errors: list[dict]) -> list[str]:
+    if not errors:
+        return []
+
+    lines = []
+    for item in sorted(errors, key=lambda err: err["line"]):
+        reason = str(item["error"]).replace("`", "'")
+        lines.append(f"Line {item['line']}: {reason}")
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    max_len = 1800
+
+    for line in lines:
+        candidate = "\n".join(current_lines + [line])
+        if current_lines and len(candidate) > max_len:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    if len(chunks) == 1:
+        return [f"Errors for `{filename}`\n{chunks[0]}"]
+
+    total = len(chunks)
+    return [f"Errors for `{filename}` ({idx}/{total})\n{chunk}" for idx, chunk in enumerate(chunks, start=1)]
+
+class PlaylistErrorsView(View):
+    def __init__(self, filename: str, errors: list[dict]):
+        super().__init__(timeout=None)
+        self.filename = filename
+        self.errors = list(errors)
+        self.show_errors.label = f"Show Errors ({len(self.errors)})"
+
+    @button(label="Show Errors", style=discord.ButtonStyle.secondary, custom_id="playlist_show_errors")
+    async def show_errors(self, inter: discord.Interaction, _btn: Button):
+        chunks = _format_playlist_error_chunks(self.filename, self.errors)
+        if not chunks:
+            return await inter.response.send_message("No playlist errors recorded.", ephemeral=True)
+
+        await inter.response.send_message(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await inter.followup.send(chunk, ephemeral=True)
+
+async def _handle_add(inter: discord.Interaction, query: str, front: bool):
+    try:
+        entry = await _resolve_track_entry(query)
+        item = _make_queue_item(entry, inter.user)
+        pos = _enqueue_item(item, front)
+
+        if pos == 1 and voice_client and not voice_client.is_playing() and not voice_client.is_paused():
+            await _play_next()
+        else:
+            asyncio.create_task(_prefetch_next(2))
+
+        await inter.followup.send(
+            embed=discord.Embed(
+                title=f"Added to Queue #{pos}",
+                description=f"[{item['title']}]({item['webpage_url']}) `{format_duration(item['duration'])}`",
+                color=discord.Color.blue()
+            ),
+            ephemeral=False
+        )
+    except TrackResolveError as e:
+        await inter.followup.send(embed=_make_track_error_embed(e), ephemeral=True)
+    except Exception as e:
+        traceback.print_exc()
+        await inter.followup.send(f"Error: {e}", ephemeral=True)
+
+async def _handle_playlist_add(inter: discord.Interaction, attachment: discord.Attachment, shuffle_queue: bool):
+    progress_msg = None
+    try:
+        if attachment is None:
+            await inter.followup.send("No file provided.", ephemeral=True)
+            return
+
+        filename = attachment.filename or "playlist"
+        suffix = os.path.splitext(filename)[1].lower()
+        if suffix not in {".txt", ".m3u8"}:
+            await inter.followup.send("Unsupported playlist format. Upload a .txt or .m3u8 file.", ephemeral=True)
+            return
+
+        progress_msg = await inter.followup.send(
+            embed=discord.Embed(
+                title="Processing Playlist",
+                description=f"Processing [{filename}]({attachment.url})",
+                color=discord.Color.blue()
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+            wait=True
+        )
+
+        raw = await attachment.read()
+        text = raw.decode("utf-8-sig", errors="ignore")
+        parsed_entries, errors = _parse_playlist_entries(text, filename)
+
+        resolved_entries = []
+        for parsed in parsed_entries:
+            try:
+                entry = await _resolve_track_entry(parsed["url"])
+                resolved_entries.append(_apply_playlist_metadata(entry, parsed.get("metadata")))
+            except TrackResolveError as exc:
+                errors.append({"line": parsed["line"], "error": str(exc)})
+            except Exception as exc:
+                traceback.print_exc()
+                errors.append({"line": parsed["line"], "error": f"Unexpected error: {exc}"})
+
+        items = [_make_queue_item(entry, inter.user) for entry in resolved_entries]
+        if items:
+            music_queue.extend(items)
+            if shuffle_queue:
+                random.shuffle(music_queue)
+
+        should_start = bool(items) and voice_client and not voice_client.is_playing() and not voice_client.is_paused()
+
+        result_embed = discord.Embed(
+            title=f"Added {len(items)} track{'s' if len(items) != 1 else ''} to queue",
+            description=f"Imported from [{filename}]({attachment.url})",
+            color=discord.Color.blue() if items else discord.Color.orange()
+        )
+        if errors:
+            result_embed.add_field(name="Errors", value=str(len(errors)), inline=True)
+        if shuffle_queue and items:
+            result_embed.add_field(name="Queue", value="Shuffled", inline=True)
+
+        view = PlaylistErrorsView(filename, errors) if errors else None
+        await progress_msg.reply(
+            embed=result_embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        if should_start:
+            await _play_next()
+        elif items:
+            asyncio.create_task(_prefetch_next(2))
+    except Exception as e:
+        traceback.print_exc()
+        error_embed = discord.Embed(
+            title="Playlist Import Failed",
+            description=str(e),
+            color=discord.Color.red()
+        )
+        if progress_msg is not None:
+            await progress_msg.reply(embed=error_embed, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await inter.followup.send(embed=error_embed, ephemeral=True)
+
 @bot.tree.command(name="nowplaying", description="Refresh the Now Playing message")
 async def nowplaying_cmd(inter: discord.Interaction):
     await inter.response.defer(thinking=True, ephemeral=False)
@@ -1039,6 +1550,14 @@ async def playfile(inter: discord.Interaction, file: discord.Attachment):
     if not await ensure_voice(inter):
         return
     asyncio.create_task(_handle_file_add(inter, file, False))
+
+@bot.tree.command(name="playlist", description="Import a .txt or .m3u8 playlist into the queue")
+@app_commands.describe(file="Upload a .txt or .m3u8 playlist file", shuffle="Shuffle the queue before playback starts")
+async def playlist(inter: discord.Interaction, file: discord.Attachment, shuffle: bool = False):
+    await inter.response.defer(thinking=True, ephemeral=False)
+    if not await ensure_voice(inter):
+        return
+    asyncio.create_task(_handle_playlist_add(inter, file, shuffle))
 
 @bot.tree.command(name="next", description="Add a song next in queue")
 @app_commands.describe(query="YouTube URL or search terms, or SoundCloud/other URL")
@@ -1293,11 +1812,15 @@ async def on_disconnect():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    global music_queue, music_history, voice_client
+    global music_queue, music_history, voice_client, now_playing_msg, text_channel, disconnect_task
 
     if member == bot.user and before.channel and not after.channel:
+        await _cancel_disconnect_task()
         music_queue.clear()
         music_history.clear()
+        voice_client = None
+        now_playing_msg = None
+        text_channel = None
         return
 
     if voice_client and before.channel == voice_client.channel and after.channel != voice_client.channel:
@@ -1307,4 +1830,19 @@ async def on_voice_state_update(member, before, after):
             if not non_bot_members and voice_client.is_paused():
                 _arm_idle_timer()
 
-bot.run(TOKEN)
+async def _run_bot():
+    async with bot:
+        try:
+            await bot.start(TOKEN)
+        finally:
+            await shutdown_cleanup()
+
+def main():
+    discord.utils.setup_logging(root=False)
+    try:
+        asyncio.run(_run_bot())
+    except KeyboardInterrupt:
+        return
+
+if __name__ == "__main__":
+    main()
