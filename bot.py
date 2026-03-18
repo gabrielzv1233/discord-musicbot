@@ -11,7 +11,7 @@ LEAVE_SOUND = "_leave.mp3"  # short, quiet chime bot exit chime (set to None to 
 CACHE_FILE = "cache.json" # Json file to store cache
 OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
 USE_CACHE = True # Disabling bypasses cache entirely
-LOW_BANDWIDTH_MODE = True # Restart the bot after changing. Reduces source bitrate and Discord voice bitrate.
+LOW_BANDWIDTH_MODE = False # Restart the bot after changing. Reduces source bitrate and Discord voice bitrate.
 
 NORMAL_SOURCE_ABR_LIMIT = 64
 LOW_BANDWIDTH_SOURCE_ABR_LIMIT = 64
