@@ -1,4 +1,4 @@
-import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os, traceback, tempfile
+import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os, traceback, tempfile, io
 from contextlib import suppress
 from discord.ui import View, Button, button
 from urllib.parse import urlparse, parse_qs
@@ -18,6 +18,7 @@ LOW_BANDWIDTH_SOURCE_ABR_LIMIT = 64
 LOW_BANDWIDTH_MIN_SOURCE_ABR = 48
 LOW_BANDWIDTH_DISCORD_BITRATE = 96
 LOW_BANDWIDTH_DISCORD_BANDWIDTH = "full"
+FFMPEG_INPUT_THREAD_QUEUE_SIZE = 256 # ffmpeg input buffer
 
 def ytdlp_updated() -> bool:
     try:
@@ -142,6 +143,43 @@ def _voice_playback_kwargs() -> dict:
         "bandwidth": LOW_BANDWIDTH_DISCORD_BANDWIDTH,
     }
 
+def _ffmpeg_before_options() -> str:
+    return (
+        f"-thread_queue_size {FFMPEG_INPUT_THREAD_QUEUE_SIZE} "
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    )
+
+def _playlist_export_url(item: dict) -> str:
+    return item.get("webpage_url") or item.get("url") or ""
+
+def _playlist_export_title(item: dict) -> str:
+    title = str(item.get("title") or "Unknown title")
+    return title.replace("\r", " ").replace("\n", " ").strip()
+
+def _playlist_export_duration(item: dict) -> int:
+    try:
+        duration = int(item.get("duration") or 0)
+    except Exception:
+        duration = 0
+    return duration if duration > 0 else -1
+
+def _build_queue_export_m3u8() -> str:
+    entries = []
+    if music_history:
+        current = music_history[0]
+        if _playlist_export_url(current):
+            entries.append(current)
+
+    for item in music_queue:
+        if _playlist_export_url(item):
+            entries.append(item)
+
+    lines = ["#EXTM3U"]
+    for item in entries:
+        lines.append(f"#EXTINF:{_playlist_export_duration(item)},{_playlist_export_title(item)}")
+        lines.append(_playlist_export_url(item))
+    return "\n".join(lines) + "\n"
+
 ydl_opts = _build_ydl_opts()
 
 stream_ydl = YoutubeDL(ydl_opts)
@@ -259,10 +297,16 @@ async def clear_all(play_leave_sound: bool = True, force_disconnect: bool = Fals
                         pass
                 except Exception:
                     traceback.print_exc()
-            await vc.disconnect(force=force_disconnect)
+            if force_disconnect:
+                await asyncio.wait_for(vc.disconnect(force=True), timeout=5)
+            else:
+                await vc.disconnect(force=False)
         except (discord.HTTPException, discord.ClientException) as e:
             if not shutting_down:
                 print(f"Failed to disconnect: {e}")
+        except asyncio.TimeoutError:
+            if not shutting_down:
+                print("Timed out while disconnecting voice client.")
     if msg and cleanup_message:
         try:
             await msg.delete()
@@ -301,6 +345,11 @@ async def shutdown_cleanup():
     except Exception:
         traceback.print_exc()
     finally:
+        try:
+            if not bot.is_closed():
+                await bot.close()
+        except Exception:
+            traceback.print_exc()
         await close_session()
         
 def _arm_idle_timer():
@@ -695,7 +744,7 @@ async def _play_next():
         vc.play(
             discord.FFmpegPCMAudio(
                 item["url"],
-                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                before_options=_ffmpeg_before_options(),
             ),
             **play_kwargs,
         )
@@ -929,6 +978,16 @@ class QueueView(View):
         self.next_page.disabled = (self.page + 1) * 10 >= len(music_queue)
         self.prev_page.disabled = self.page == 0
         await inter.response.edit_message(embed=make_queue_embed(self.page), view=self)
+
+    @button(label="Export", style=discord.ButtonStyle.secondary, custom_id="export_queue")
+    async def export_queue(self, inter: discord.Interaction, _btn: Button):
+        playlist_text = _build_queue_export_m3u8()
+        payload = io.BytesIO(playlist_text.encode("utf-8"))
+        payload.seek(0)
+        await inter.response.send_message(
+            file=discord.File(payload, filename="queue-export.m3u8"),
+            ephemeral=False
+        )
 
 async def _extract_soundcloud_info(url: str) -> dict:
     def _run():
