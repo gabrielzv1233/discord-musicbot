@@ -16,7 +16,10 @@ import asyncio
 import discord
 import random
 
-load_dotenv()
+if os.path.exists(".env"):
+    load_dotenv()
+else:
+    load_dotenv('f.env')
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
 LEAVE_SOUND = os.getenv("LEAVE_SOUND", "leave.mp3")
