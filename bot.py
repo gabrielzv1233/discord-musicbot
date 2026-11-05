@@ -16,21 +16,24 @@ import asyncio
 import discord
 import random
 
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN") or "YOUR_DISCORD_BOT_TOKEN_HERE" 
-LEAVE_SOUND = os.environ.get("LEAVE_SOUND") or "leave.mp3" # short, quiet chime bot exit chime (set to None to disable)
-CACHE_FILE = os.environ.get("CACHE_FILE") or "cache.json" # Json file to store cache
-OWNER_ONLY = os.environ.get("RESTRICT_MANAGEMENT_COMMANDS") or True # Restrict some commands to bot owner only (cache management commands)
-USE_CACHE = os.environ.get("USE_CACHE") or True # Disabling bypasses cache entirely
-LOW_BANDWIDTH_MODE = os.environ.get("LOW_BANDWIDTH_MODE") or True # Restart the bot after changing. Reduces source bitrate and Discord voice bitrate.
+load_dotenv()
 
+TOKEN = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
+LEAVE_SOUND = os.getenv("LEAVE_SOUND", "leave.mp3")
+CACHE_FILE = os.getenv("CACHE_FILE", "cache.json")
+OWNER_ONLY = os.getenv("RESTRICT_MANAGEMENT_COMMANDS", "true").lower() in ("true", "1", "yes")
+USE_CACHE = os.getenv("USE_CACHE", "true").lower() in ("true", "1", "yes")
+LOW_BANDWIDTH_MODE = os.getenv("LOW_BANDWIDTH_MODE", "true").lower() in ("true", "1", "yes")
+
+if LEAVE_SOUND.lower() in ("none", "null", ""):
+    LEAVE_SOUND = None
+    
 NORMAL_SOURCE_ABR_LIMIT = 64
 LOW_BANDWIDTH_SOURCE_ABR_LIMIT = 64
 LOW_BANDWIDTH_MIN_SOURCE_ABR = 48
 LOW_BANDWIDTH_DISCORD_BITRATE = 96
 LOW_BANDWIDTH_DISCORD_BANDWIDTH = "full"
 FFMPEG_INPUT_THREAD_QUEUE_SIZE = 256 # ffmpeg input buffer
-
-if (LEAVE_SOUND == "None"): LEAVE_SOUND = None
 
 def ytdlp_updated() -> tuple[bool, str, str] | None:
     try:
