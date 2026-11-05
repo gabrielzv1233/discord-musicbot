@@ -6,3 +6,8 @@ cookies.txt
 _leave.*
 .vscode/
 __pycache__/
+*.tmp
+tmp*
+test*
+*.env
+*.m3u8

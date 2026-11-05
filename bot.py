@@ -1,17 +1,27 @@
-import importlib.metadata, requests, aiohttp, asyncio, discord, random, json, re, os, traceback, tempfile, io
-from contextlib import suppress
-from discord.ui import View, Button, button
-from urllib.parse import urlparse, parse_qs
+from discord.ui import Button, button, View
+from urllib.parse import parse_qs, urlparse
+from mutagen import File as MutagenFile
 from discord import app_commands
 from discord.ext import commands
-from mutagen import File as MutagenFile
+from contextlib import suppress
+from dotenv import load_dotenv
+from yt_dlp import YoutubeDL
+import importlib.metadata
+import json, io, os, re
+import traceback
+import requests
+import tempfile
+import aiohttp
+import asyncio
+import discord
+import random
 
-TOKEN = "bot token"
-LEAVE_SOUND = "_leave.mp3"  # short, quiet chime bot exit chime (set to None to disable)
-CACHE_FILE = "cache.json" # Json file to store cache
-OWNER_ONLY = True # Restrict some commands to bot owner only (cache management commands)
-USE_CACHE = True # Disabling bypasses cache entirely
-LOW_BANDWIDTH_MODE = False # Restart the bot after changing. Reduces source bitrate and Discord voice bitrate.
+TOKEN = os.environ.get("DISCORD_BOT_TOKEN") or "YOUR_DISCORD_BOT_TOKEN_HERE" 
+LEAVE_SOUND = os.environ.get("LEAVE_SOUND") or "leave.mp3" # short, quiet chime bot exit chime (set to None to disable)
+CACHE_FILE = os.environ.get("CACHE_FILE") or "cache.json" # Json file to store cache
+OWNER_ONLY = os.environ.get("RESTRICT_MANAGEMENT_COMMANDS") or True # Restrict some commands to bot owner only (cache management commands)
+USE_CACHE = os.environ.get("USE_CACHE") or True # Disabling bypasses cache entirely
+LOW_BANDWIDTH_MODE = os.environ.get("LOW_BANDWIDTH_MODE") or True # Restart the bot after changing. Reduces source bitrate and Discord voice bitrate.
 
 NORMAL_SOURCE_ABR_LIMIT = 64
 LOW_BANDWIDTH_SOURCE_ABR_LIMIT = 64
@@ -20,11 +30,13 @@ LOW_BANDWIDTH_DISCORD_BITRATE = 96
 LOW_BANDWIDTH_DISCORD_BANDWIDTH = "full"
 FFMPEG_INPUT_THREAD_QUEUE_SIZE = 256 # ffmpeg input buffer
 
-def ytdlp_updated() -> bool:
+if (LEAVE_SOUND == "None"): LEAVE_SOUND = None
+
+def ytdlp_updated() -> tuple[bool, str, str] | None:
     try:
         local = importlib.metadata.version("yt-dlp")
     except importlib.metadata.PackageNotFoundError:
-        return False
+        return None
 
     resp = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=5)
     resp.raise_for_status()
@@ -33,14 +45,16 @@ def ytdlp_updated() -> bool:
     return local == latest, local, latest
 
 try:
-    updated, localver, latestver = ytdlp_updated()
-    if not updated:
-        print(f"Updating yt-dlp from {localver} to {latestver}...")
-        os.system("python -m pip install -U yt-dlp")
+    update_status = ytdlp_updated()
+    if update_status is None:
+        print("yt-dlp is not installed; using imported yt_dlp package")
     else:
-        print(f"yt-dlp runnning {localver} (up to date)")
-
-    from yt_dlp import YoutubeDL
+        updated, localver, latestver = update_status
+        if not updated:
+            print(f"Updating yt-dlp from {localver} to {latestver}...")
+            os.system("python -m pip install -U yt-dlp")
+        else:
+            print(f"yt-dlp running {localver} (up to date)")
 
 except Exception as e:
     traceback.print_exc()

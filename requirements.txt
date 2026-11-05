@@ -1,4 +1,6 @@
+discord.py
+requests
+mutagen
 PyNaCl
-discord.Py
+yt-dlp
 davey
-yt_dlp
