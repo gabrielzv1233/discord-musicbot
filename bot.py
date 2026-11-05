@@ -21,7 +21,7 @@ if os.path.exists(".env"):
 else:
     load_dotenv('f.env')
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
+TOKEN = os.getenv("TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
 LEAVE_SOUND = os.getenv("LEAVE_SOUND", "leave.mp3")
 CACHE_FILE = os.getenv("CACHE_FILE", "cache.json")
 OWNER_ONLY = os.getenv("RESTRICT_MANAGEMENT_COMMANDS", "true").lower() in ("true", "1", "yes")
