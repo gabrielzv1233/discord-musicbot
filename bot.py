@@ -542,6 +542,8 @@ def _apply_playlist_metadata(entry: dict, metadata: dict | None) -> dict:
 async def _prefetch_next(n: int = 2):
     tasks = []
     for item in music_queue[:max(0, n)]:
+        if item.get("soundcloud_playlist_track"):
+            continue
         async def ensure_item(i=item):
             ok = await _url_is_valid(i["url"])
             if not ok:
@@ -710,7 +712,24 @@ async def _play_next():
         _arm_idle_timer()
         return
 
-    item = music_queue.pop(0)
+    item = None
+    while music_queue:
+        candidate = music_queue.pop(0)
+        if candidate.get("soundcloud_playlist_track"):
+            try:
+                fresh = await _extract_soundcloud_info(candidate["webpage_url"])
+                for key in ("url", "webpage_url", "title", "duration", "uploader"):
+                    candidate[key] = fresh[key]
+            except Exception:
+                traceback.print_exc()
+                print(f"Skipping unavailable SoundCloud playlist track: {candidate['webpage_url']}")
+                continue
+        item = candidate
+        break
+
+    if item is None:
+        return await _play_next()
+
     music_history.insert(0, item)
 
     try:
@@ -1466,6 +1485,114 @@ class PlaylistErrorsView(View):
         for chunk in chunks[1:]:
             await inter.followup.send(chunk, ephemeral=True)
 
+
+def _is_soundcloud_playlist_url(query: str) -> bool:
+    raw = _normalize_query(query)
+    parsed = urlparse(raw if "://" in raw else "https://" + raw)
+    host = (parsed.hostname or "").lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host in {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"}:
+        return len(parts) >= 3 and parts[1].lower() == "sets"
+    if host in {"api.soundcloud.com", "api-v2.soundcloud.com"}:
+        return len(parts) == 2 and parts[0].lower() == "playlists"
+    return False
+
+
+def _is_soundcloud_shortlink(query: str) -> bool:
+    raw = _normalize_query(query)
+    parsed = urlparse(raw if "://" in raw else "https://" + raw)
+    return (parsed.hostname or "").lower() == "on.soundcloud.com"
+
+
+def _soundcloud_flat_track(entry: dict, requester: discord.abc.User) -> dict | None:
+    url = entry.get("url") or entry.get("webpage_url")
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        return None
+
+    path_parts = [part for part in urlparse(url).path.split("/") if part]
+    title = entry.get("title")
+    if not title:
+        title = path_parts[-1].replace("-", " ").replace("_", " ").strip().title() if path_parts else "SoundCloud Track"
+
+    uploader = entry.get("uploader") or entry.get("uploader_id")
+    if not uploader:
+        uploader = path_parts[0].replace("-", " ") if len(path_parts) > 1 else "SoundCloud"
+
+    return {
+        "url": url,
+        "webpage_url": url,
+        "title": title,
+        "duration": entry.get("duration") or 0,
+        "uploader": uploader,
+        "requester": requester,
+        "soundcloud_playlist_track": True,
+    }
+
+
+async def _extract_soundcloud_playlist(url: str) -> dict:
+    def _run():
+        opts = _build_ydl_opts(extract_flat=True)
+        opts["noplaylist"] = False
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    return await asyncio.to_thread(_run)
+
+
+async def _handle_soundcloud_playlist_add(inter: discord.Interaction, query: str):
+    progress_msg = None
+    try:
+        progress_msg = await inter.followup.send(
+            embed=discord.Embed(
+                title="Loading SoundCloud Playlist",
+                description="Fetching tracks from SoundCloud...",
+                color=discord.Color.blue(),
+            ),
+            wait=True,
+        )
+
+        playlist_url = _normalize_query(query)
+        if "://" not in playlist_url:
+            playlist_url = "https://" + playlist_url
+        raw = await _extract_soundcloud_playlist(playlist_url)
+        if not isinstance(raw, dict) or "entries" not in raw:
+            if _is_soundcloud_shortlink(query):
+                await progress_msg.delete()
+                await _handle_add(inter, query, False)
+                return
+            raise PlaylistFormatError("SoundCloud did not return a playlist for this URL.")
+
+        entries = list(raw.get("entries") or [])
+        items = [_soundcloud_flat_track(entry, inter.user) for entry in entries if isinstance(entry, dict)]
+        skipped = len(entries) - sum(item is not None for item in items)
+        items = [item for item in items if item is not None]
+        if not items:
+            raise PlaylistFormatError("This SoundCloud playlist has no playable tracks.")
+
+        start_position = len(music_queue) + 1
+        music_queue.extend(items)
+
+        result = discord.Embed(
+            title=f"Added {len(items)} SoundCloud tracks to queue",
+            description=f"[{raw.get('title') or 'SoundCloud Playlist'}]({playlist_url})",
+            color=discord.Color.blue(),
+        )
+        result.add_field(name="Starts at", value=f"#{start_position}", inline=True)
+        if skipped:
+            result.add_field(name="Skipped", value=str(skipped), inline=True)
+        await progress_msg.edit(embed=result)
+
+        if voice_client and not voice_client.is_playing() and not voice_client.is_paused():
+            await _play_next()
+    except Exception as exc:
+        traceback.print_exc()
+        error = discord.Embed(title="SoundCloud Playlist Failed", description=str(exc), color=discord.Color.red())
+        if progress_msg is not None:
+            await progress_msg.edit(embed=error)
+        else:
+            await inter.followup.send(embed=error, ephemeral=True)
+
+
 async def _handle_add(inter: discord.Interaction, query: str, front: bool):
     try:
         entry = await _resolve_track_entry(query)
@@ -1614,13 +1741,16 @@ async def join(inter: discord.Interaction):
     if await ensure_voice(inter):
         await inter.followup.send("✅ Joined your voice channel.", ephemeral=False)
 
-@bot.tree.command(name="play", description="Add a song to the queue")
-@app_commands.describe(query="YouTube URL or search terms, or SoundCloud/other URL")
+@bot.tree.command(name="play", description="Queue a song or SoundCloud playlist")
+@app_commands.describe(query="YouTube search/URL, SoundCloud track/playlist URL, or other media URL")
 async def play(inter: discord.Interaction, query: str):
     await inter.response.defer(thinking=True, ephemeral=False)
     if not await ensure_voice(inter):
         return
-    asyncio.create_task(_handle_add(inter, query, False))
+    if _is_soundcloud_playlist_url(query) or _is_soundcloud_shortlink(query):
+        asyncio.create_task(_handle_soundcloud_playlist_add(inter, query))
+    else:
+        asyncio.create_task(_handle_add(inter, query, False))
 
 @bot.tree.command(name="playfile", description="Add an audio/video file to the queue")
 @app_commands.describe(file="Audio or video file attachment")
